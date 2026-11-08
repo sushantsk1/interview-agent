@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "runtime": "Native development-tool adapters",
+  "supportedHosts": ["codex", "claude", "antigravity"],
+  "roles": [
+    { "name": "lead", "description": "Coordinates the project, internal decisions, task ownership, integration, and final delivery. The primary session performs this role." },
+    { "name": "requirements", "description": "Turns the user's idea into scope, assumptions, user flows, and measurable acceptance criteria." },
+    { "name": "researcher", "description": "Investigates bounded technical questions and recommends practical options using evidence." },
+    { "name": "frontend", "description": "Builds the user interface and client behavior, coordinating an explicit contract with backend." },
+    { "name": "backend", "description": "Builds APIs, business logic, persistence, and integrations, coordinating an explicit contract with frontend." },
+    { "name": "tester", "description": "Independently tests the integrated product and records criterion-level evidence and reproducible defects." },
+    { "name": "product_reviewer", "description": "Independently evaluates the integrated product against user intent, acceptance criteria, and usability." }
+  ]
+}

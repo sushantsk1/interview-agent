@@ -1,0 +1,30 @@
+node_modules/
+.agent-team/work/
+.agent-team/.install-*/
+*.log
+.env
+.env.*
+!.env.example
+.agent-team/local.json
+# Test projects and live-host trial artifacts always remain local.
+validation/
+.agent-team-transaction-*/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.pytest_cache/
+
+# Databases
+*.db
+*.sqlite3
+
+# Frontend build & dependencies
+frontend/node_modules/
+frontend/dist/
+dist/
+

@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "originalRequest": { "text": "", "evidence": { "path": ".agent-team/work/BRIEF.md", "sha256": "" } },
+  "roster": {
+    "lead": { "agentId": "" },
+    "requirements": { "agentId": "" },
+    "researcher": { "agentId": "" },
+    "frontend": { "agentId": "" },
+    "backend": { "agentId": "" },
+    "tester": { "agentId": "" },
+    "product_reviewer": { "agentId": "" }
+  },
+  "sourceSnapshot": [],
+  "tasks": [],
+  "criteria": [],
+  "checks": [],
+  "defects": [],
+  "review": { "decision": "pending", "reviewedBy": "", "sourceSnapshotSha256": "", "evidence": [] },
+  "handoff": { "runInstructions": "", "evidence": { "path": ".agent-team/work/HANDOFF.md", "sha256": "" } }
+}
