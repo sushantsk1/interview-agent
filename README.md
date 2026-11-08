@@ -117,3 +117,4 @@ npm run build
 
 ## 📄 License
 MIT License. Built with ❤️ for automated, objective, and empathetic technical hiring.
+
