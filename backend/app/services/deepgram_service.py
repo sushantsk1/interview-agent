@@ -5,6 +5,7 @@ import os
 import struct
 import wave
 from typing import AsyncIterator, Optional, Tuple
+from contextlib import aclosing
 
 from backend.app.config import settings
 
@@ -127,6 +128,33 @@ class DeepgramVoiceService:
         except Exception as e:
             logger.warning("Deepgram TTS synthesis failed (%s); returning synthetic audio fallback.", e)
             return generate_synthetic_mp3(num_frames=8)
+
+    async def stream_speech(self, text: str) -> AsyncIterator[bytes]:
+        """Yield raw mono PCM16/24kHz provider chunks without buffering the reply.
+
+        Unlike MP3 transport fragments these samples can be scheduled immediately
+        by Web Audio, even when network boundaries split a sample. Cancellation is
+        propagated. Provider failures are explicit rather than silent fake speech.
+        """
+        if self.is_mock_mode:
+            yield b"\x00\x00" * 2400
+            return
+        client = self._get_client()
+        if client is None:
+            raise RuntimeError("Deepgram client unavailable")
+        emitted = False
+        stream = client.speak.v1.audio.generate(
+            text=text, model=self.tts_model, encoding="linear16",
+            sample_rate=24000, container="none",
+            request_options={"timeout_in_seconds": 15, "max_retries": 0},
+        )
+        async with aclosing(stream):
+            async for chunk in stream:
+                if chunk:
+                    emitted = True
+                    yield bytes(chunk)
+        if not emitted:
+            raise RuntimeError("Deepgram returned no speech audio")
 
     async def transcribe_audio(
         self,

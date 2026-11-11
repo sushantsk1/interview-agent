@@ -10,7 +10,7 @@ An intelligent, autonomous AI technical screening platform that conducts multi-m
 * **Split-Screen Interface**: Left pane shows the candidate's live webcam feed (with Fit / Fill camera framing toggle); right pane shows the real-time transcript stream.
 * **Animated AI Interviewer Avatar**: Real-time state indicator reflecting whether the AI interviewer is *idle*, *listening*, *thinking*, or *speaking*.
 * **Real-Time Voice Pipeline**:
-  * **Text-to-Speech (TTS)**: Spoken questions using Deepgram Aura-2.
+  * **Text-to-Speech (TTS)**: Question text streams into Deepgram Aura-2 in short phrases. Raw 24 kHz PCM audio streams to the browser as it arrives, with progressive transcript updates and continuous Web Audio playback.
   * **Speech-to-Text (STT)**: Low-latency candidate audio transcription using Deepgram Nova-3 with client-side Web Speech recognition fallback for instant visual feedback.
 * **Hybrid Turn-Taking Detection**: Automatically detects when the candidate finishes speaking using silence duration detection (2.75s threshold) alongside an explicit manual **Done Answering** button.
 * **Text Fallback**: Candidates can seamlessly type their responses if their microphone or audio device experiences issues.
@@ -103,7 +103,7 @@ Open **`http://localhost:5173`** in your browser.
 ```bash
 pytest backend/tests/ -v
 ```
-*Includes 41 comprehensive tests across REST APIs, WebSocket protocols, LangGraph state machine transitions, resume parsing, and mock offline voice services.*
+Includes REST, WebSocket, graph, resume parsing, delayed-provider streaming, and offline voice regression tests.
 
 ### Frontend Test Suite (Vitest)
 ```bash
@@ -111,7 +111,26 @@ cd frontend
 npm test -- --run
 npm run build
 ```
-*Includes 51 unit & component tests covering webcam previews, audio player/recorders, silence timers, chat transcripts, and recruiter dashboard views.*
+Includes component and hook tests for progressive transcripts, streamed PCM scheduling, split audio samples, packet gaps, playback completion, and the existing interview flows.
+
+### Streaming behavior
+
+Interviewer prose is generated outside the WebSocket event loop and sent to TTS
+in short phrases. The browser receives cumulative `question` updates and base64
+PCM16 little-endian mono `audio` packets (`sample_rate: 24000`). Each utterance has
+a `stream_id`; an empty `is_final_chunk: true` packet ends the audio stream.
+The browser sends `playback_complete` with that ID after its scheduled audio drains.
+The server then enables candidate input. Deploy the matching frontend and backend
+together: the new streaming protocol requires this playback acknowledgment.
+
+If the browser blocks automatic sound, click **Enable audio** in the interview
+room. If speech is unavailable, choose **Continue with text** to finish that
+utterance without voice. Microphone input stays paused until interviewer playback finishes. Closing
+remarks finish before the completion screen appears.
+
+No API keys are needed for offline tests: `INTERVIEW_MOCK_LLM=true` and
+`MOCK_DEEPGRAM=true` force deterministic model output and silent test audio.
+Live speech quality and provider latency require valid NVIDIA and Deepgram keys.
 
 ---
 

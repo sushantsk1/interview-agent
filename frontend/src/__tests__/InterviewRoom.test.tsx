@@ -1,4 +1,4 @@
-﻿import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, fireEvent, waitFor, act } from '@testing-library/react';
 import { MemoryRouter, Routes, Route } from 'react-router-dom';
 import { InterviewRoom } from '../pages/InterviewRoom';
@@ -92,6 +92,7 @@ describe('InterviewRoom Component (AC-008 to AC-014, AC-022, AC-026)', () => {
   afterEach(() => {
     (window as any).WebSocket = originalWebSocket;
     vi.clearAllMocks();
+    vi.unstubAllGlobals();
   });
 
   const renderRoom = () => {
@@ -319,6 +320,61 @@ describe('InterviewRoom Component (AC-008 to AC-014, AC-022, AC-026)', () => {
     // Clicking View Results navigates to results
     fireEvent.click(screen.getByText(/View Results/i));
     expect(screen.getByTestId('results-screen')).toBeInTheDocument();
+  });
+
+  it('updates one transcript entry as cumulative question text streams', async () => {
+    renderRoom();
+    await waitFor(() => expect(mockWsInstances.length).toBeGreaterThan(0));
+    const ws = mockWsInstances[0];
+    act(() => ws.triggerOpen());
+    act(() => ws.triggerMessage({ type: 'question', stream_id: 'question-1', turn_index: 1, topic: 'APIs', text: 'How would you', is_follow_up: false, is_final: false }));
+    expect(screen.getByText('How would you')).toBeInTheDocument();
+    act(() => ws.triggerMessage({ type: 'question', stream_id: 'question-1', turn_index: 1, topic: 'APIs', text: 'How would you design a reliable API?', is_follow_up: false, is_final: true }));
+    expect(screen.queryByText('How would you')).not.toBeInTheDocument();
+    expect(screen.getAllByText('How would you design a reliable API?')).toHaveLength(1);
+  });
+
+  it('waits for the server listening acknowledgment before enabling candidate input', async () => {
+    renderRoom();
+    await waitFor(() => expect(mockWsInstances.length).toBeGreaterThan(0));
+    const ws = mockWsInstances[0];
+    act(() => ws.triggerOpen());
+    act(() => ws.triggerMessage({ type: 'status', state: 'speaking', question_index: 1, total_questions: 5, time_elapsed_seconds: 0 }));
+    act(() => ws.triggerMessage({ type: 'audio', stream_id: 'drained', turn_index: 1, data: '', format: 'audio/pcm', sample_rate: 24000, is_final_chunk: true }));
+    expect(ws.sentMessages.map(m => JSON.parse(m))).toContainEqual({ type: 'playback_complete', stream_id: 'drained' });
+    expect(screen.getByRole('button', { name: /Done Answering/ })).toBeDisabled();
+    act(() => ws.triggerMessage({ type: 'status', state: 'listening', question_index: 1, total_questions: 5, time_elapsed_seconds: 0 }));
+    expect(screen.getByRole('button', { name: /Done Answering/ })).toBeEnabled();
+  });
+
+  it('keeps closing playback alive and acknowledges only after final audio drains', async () => {
+    const sources: any[] = [];
+    const close = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal('AudioContext', class {
+      currentTime = 0; state = 'running'; destination = {}; close = close;
+      createBuffer(_channels: number, count: number, rate: number) {
+        return { duration: count / rate, getChannelData: () => new Float32Array(count) };
+      }
+      createBufferSource() {
+        const source = { connect: vi.fn(), disconnect: vi.fn(), start: vi.fn(), stop: vi.fn(), onended: null };
+        sources.push(source); return source;
+      }
+    });
+    renderRoom();
+    await waitFor(() => expect(mockWsInstances.length).toBeGreaterThan(0));
+    const ws = mockWsInstances[0];
+    act(() => ws.triggerOpen());
+    act(() => ws.triggerMessage({ type: 'audio', stream_id: 'closing', turn_index: 5, data: btoa('\x00\x00'), format: 'audio/pcm', sample_rate: 24000, is_final_chunk: false }));
+    act(() => sources[0].onended());
+    expect(screen.getByText(/Done Answering \/ Next/i).closest('button')).toBeDisabled();
+    act(() => ws.triggerMessage({ type: 'audio', stream_id: 'closing', turn_index: 5, data: btoa('\x00\x00'), format: 'audio/pcm', sample_rate: 24000, is_final_chunk: true }));
+    act(() => ws.triggerMessage({ type: 'interview_complete', session_id: 'session-xyz-123', closing_message: 'Thank you for your time.' }));
+    expect(screen.queryByText(/Thank You, Alex Rivera!/i)).not.toBeInTheDocument();
+    expect(close).not.toHaveBeenCalled();
+    expect(ws.sentMessages.map(m => JSON.parse(m))).not.toContainEqual({ type: 'playback_complete', stream_id: 'closing' });
+    act(() => sources[1].onended());
+    expect(ws.sentMessages.map(m => JSON.parse(m))).toContainEqual({ type: 'playback_complete', stream_id: 'closing' });
+    expect(screen.getByText(/Thank You, Alex Rivera!/i)).toBeInTheDocument();
   });
 
   it('displays reconnect banner and allows manual retry on connection loss (AC-026)', async () => {

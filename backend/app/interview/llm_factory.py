@@ -110,7 +110,7 @@ class MockChatModel(BaseChatModel):
                 }, indent=2)
 
         # 3. Follow-up prompt
-        if "adaptive follow-up question is warranted" in prompt_lower or "needs_follow_up" in prompt_lower:
+        if ("adaptive follow-up question is warranted" in prompt_lower or "needs_follow_up" in prompt_lower) and "score the answer strictly" not in prompt_lower:
             candidate_ans = ""
             m = re.search(r'Candidate Answer:\s*"([^"]*)"', prompt, re.IGNORECASE | re.DOTALL)
             if m:
@@ -151,6 +151,7 @@ class MockChatModel(BaseChatModel):
                     "depth": 2.0,
                     "correctness": 2.0,
                     "communication": 6.5,
+                    "needs_follow_up": False, "follow_up_question": "",
                     "feedback": "Candidate honestly acknowledged lack of direct experience with this concept."
                 }, indent=2)
 
@@ -160,6 +161,7 @@ class MockChatModel(BaseChatModel):
                     "depth": 3.0,
                     "correctness": 4.0,
                     "communication": 5.0,
+                    "needs_follow_up": False, "follow_up_question": "",
                     "feedback": "Answer was overly brief and did not provide sufficient technical context."
                 }, indent=2)
 
@@ -168,6 +170,7 @@ class MockChatModel(BaseChatModel):
                 "depth": 8.0,
                 "correctness": 8.5,
                 "communication": 8.5,
+                "needs_follow_up": True, "follow_up_question": "How would you validate your approach under peak load and unexpected failures?",
                 "feedback": "Thorough, structured explanation demonstrating solid practical knowledge and awareness of trade-offs."
             }, indent=2)
 
@@ -258,7 +261,7 @@ class MockChatModel(BaseChatModel):
         return "Could you elaborate on your experience in designing and delivering resilient backend systems?"
 
 
-def get_llm(temperature: float = 0.3):
+def get_llm(temperature: float = 0.3, max_tokens: int = 600):
     """
     Returns ChatOpenAI pointed to NVIDIA NIM if NVIDIA_API_KEY is configured.
     Otherwise returns MockChatModel for offline, zero-key development & testing (AC-028).
@@ -274,7 +277,8 @@ def get_llm(temperature: float = 0.3):
                 base_url="https://integrate.api.nvidia.com/v1",
                 model=settings.NVIDIA_MODEL,
                 temperature=temperature,
-                max_tokens=400,
+                max_tokens=max_tokens,
+                max_retries=0,
                 timeout=15.0,
                 extra_body={"chat_template_kwargs": {"thinking": False}},
             )
@@ -300,3 +304,21 @@ def safe_llm_invoke(llm: Any, prompt: str) -> str:
         logger.warning(f"LLM invocation failed: {e}. Executing graceful fallback (AC-028).")
         mock = MockChatModel()
         return mock.generate_deterministic_response(prompt)
+
+
+def safe_llm_stream(llm: Any, prompt: str):
+    """Yield prose immediately; never splice fallback text into partial speech."""
+    emitted = False
+    try:
+        for chunk in llm.stream(prompt):
+            text = chunk if isinstance(chunk, str) else chunk.content
+            if isinstance(text, str) and text:
+                emitted = True
+                yield text
+        if not emitted:
+            raise ValueError("Empty model stream")
+    except Exception:
+        if emitted:
+            raise
+        logger.warning("LLM stream failed before first token; using offline fallback")
+        yield MockChatModel().generate_deterministic_response(prompt)

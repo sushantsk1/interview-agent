@@ -68,17 +68,33 @@ export const InterviewRoom: React.FC = () => {
     stopAllTracks,
   } = useMediaStream(true);
 
+  const playbackActiveRef = React.useRef(false);
+  const streamingPlaybackRef = React.useRef(false);
+  const completionPendingRef = React.useRef(false);
+  const acknowledgePlaybackRef = React.useRef<(streamId: string) => void>(() => {});
+
   // Audio Playback Hook (AC-009, AC-010)
   const {
-    isPlaying: isAudioPlaying,
+    playbackError,
+    retryAudio,
+    skipAudio,
+    failAudio,
     queueAudio,
     stopAudio,
   } = useAudioPlayer({
     onPlaybackStarted: () => {
+      playbackActiveRef.current = true;
       setAgentState('speaking');
     },
+    onStreamEnded: (streamId) => acknowledgePlaybackRef.current(streamId),
     onPlaybackEnded: () => {
-      setAgentState((current) => (current === 'completed' ? 'completed' : 'listening'));
+      playbackActiveRef.current = false;
+      if (completionPendingRef.current) {
+        setIsCompleted(true);
+        setAgentState('completed');
+      } else if (!streamingPlaybackRef.current) {
+        setAgentState((current) => (current === 'completed' ? 'completed' : 'listening'));
+      }
     },
   });
 
@@ -87,6 +103,7 @@ export const InterviewRoom: React.FC = () => {
     isConnected,
     isConnecting,
     connectionError,
+    sendOutgoingMessage,
     sendAudioChunk,
     sendTranscriptUpdate,
     sendDoneAnswering,
@@ -99,7 +116,7 @@ export const InterviewRoom: React.FC = () => {
     candidateEmail,
     enabled: !loading && !isCompleted && Boolean(token),
     onStatus: (msg) => {
-      if (!isAudioPlaying) {
+      if (!playbackActiveRef.current) {
         setAgentState(msg.state);
       }
       if (msg.question_index) setQuestionIndex(msg.question_index);
@@ -112,25 +129,24 @@ export const InterviewRoom: React.FC = () => {
       }
     },
     onQuestion: (msg) => {
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: `q-${msg.turn_index}-${Date.now()}`,
-          turn_index: msg.turn_index,
-          speaker: 'interviewer',
-          text: msg.text,
-          topic: msg.topic,
-          timestamp: new Date().toISOString(),
-        },
-      ]);
+      setMessages((prev) => {
+        const id = msg.stream_id ? `q-${msg.stream_id}` : `q-${msg.turn_index}-${Date.now()}`;
+        const question: ChatMessage = {
+          id, turn_index: msg.turn_index, speaker: 'interviewer', text: msg.text,
+          topic: msg.topic, timestamp: new Date().toISOString(), is_final: msg.is_final,
+        };
+        const existing = prev.findIndex((item) => item.id === id);
+        return existing < 0 ? [...prev, question] : prev.map((item, index) => index === existing ? { ...item, ...question } : item);
+      });
       if (msg.turn_index) setQuestionIndex(msg.turn_index);
       setInterimTranscript('');
       setSilenceSeconds(0);
     },
     onAudio: (msg) => {
-      if (msg.data) {
-        queueAudio(msg.data, msg.format || 'audio/mp3');
-      }
+      streamingPlaybackRef.current = msg.format === 'audio/pcm';
+      queueAudio(msg.data, msg.format || 'audio/mp3', {
+        streamId: msg.stream_id, sampleRate: msg.sample_rate, isFinalChunk: msg.is_final_chunk,
+      });
     },
     onTranscript: (msg) => {
       if (msg.is_final) {
@@ -160,17 +176,33 @@ export const InterviewRoom: React.FC = () => {
       setSilenceSeconds(msg.silence_seconds);
       setThresholdSeconds(msg.threshold_seconds);
     },
+    onError: (msg) => {
+      if ('code' in msg && msg.code === 'AUDIO_UNAVAILABLE' && msg.stream_id) failAudio(msg.stream_id);
+    },
     onInterviewComplete: (msg) => {
-      setIsCompleted(true);
+      completionPendingRef.current = true;
+      if (!playbackActiveRef.current) {
+        setIsCompleted(true);
+        setAgentState('completed');
+      }
       setClosingMessage(
         msg.closing_message ||
           'Thank you for completing your screening interview! Your responses have been submitted to the recruitment team.'
       );
-      setAgentState('completed');
-      stopAudio();
       stopAllTracks();
     },
   });
+
+  acknowledgePlaybackRef.current = (streamId) => {
+    sendOutgoingMessage({ type: 'playback_complete', stream_id: streamId });
+  };
+
+  useEffect(() => {
+    if (!isConnected) {
+      stopAudio();
+      playbackActiveRef.current = false;
+    }
+  }, [isConnected, stopAudio]);
 
   // Live Browser Speech-to-Text Recognition (for instant visual feedback & zero latency)
   const recognitionRef = React.useRef<any>(null);
@@ -486,6 +518,16 @@ export const InterviewRoom: React.FC = () => {
             >
               Use Text Fallback
             </button>
+          </div>
+        </div>
+      )}
+
+      {playbackError && (
+        <div role="alert" className="bg-amber-950 px-4 py-3 text-amber-100 flex items-center justify-between gap-3">
+          <span>{playbackError}</span>
+          <div className="flex gap-4">
+            <button type="button" onClick={retryAudio} className="underline font-semibold">Enable audio</button>
+            <button type="button" onClick={skipAudio} className="underline font-semibold">Continue with text</button>
           </div>
         </div>
       )}

@@ -61,3 +61,5 @@ class InterviewState(TypedDict, total=False):
     time_elapsed_seconds: int
     next_action: Optional[str]
     last_evaluation: Optional[TurnEvaluation]
+
+    follow_up_proposal: Optional[Dict[str, Any]]

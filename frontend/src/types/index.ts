@@ -117,6 +117,8 @@ export type WSIncomingMessage =
       topic: string;
       text: string;
       is_follow_up: boolean;
+      stream_id?: string;
+      is_final?: boolean;
     }
   | {
       type: 'audio';
@@ -124,6 +126,8 @@ export type WSIncomingMessage =
       data: string;
       format: string;
       is_final_chunk: boolean;
+      stream_id?: string;
+      sample_rate?: number;
     }
   | {
       type: 'transcript';
@@ -145,12 +149,14 @@ export type WSIncomingMessage =
       type: 'error';
       code: string;
       message: string;
+      stream_id?: string;
     }
   | {
       type: 'pong';
     };
 
 export type WSOutgoingMessage =
+  | { type: 'playback_complete'; stream_id: string }
   | {
       type: 'start';
       candidate_name: string;

@@ -180,6 +180,10 @@ export function useInterviewWebSocket({
     // Close any previous socket cleanly
     if (wsRef.current) {
       try {
+        wsRef.current.onopen = null;
+        wsRef.current.onmessage = null;
+        wsRef.current.onerror = null;
+        wsRef.current.onclose = null;
         wsRef.current.close();
       } catch {
         // ignore
@@ -198,7 +202,7 @@ export function useInterviewWebSocket({
       wsRef.current = ws;
 
       ws.onopen = () => {
-        if (isUnmountedRef.current) return;
+        if (isUnmountedRef.current || wsRef.current !== ws) return;
         setIsConnected(true);
         setIsConnecting(false);
         setConnectionError(null);
@@ -221,7 +225,7 @@ export function useInterviewWebSocket({
       };
 
       ws.onmessage = (event: MessageEvent) => {
-        if (isUnmountedRef.current) return;
+        if (isUnmountedRef.current || wsRef.current !== ws) return;
         try {
           const msg = JSON.parse(event.data) as WSIncomingMessage;
           switch (msg.type) {
@@ -257,14 +261,14 @@ export function useInterviewWebSocket({
       };
 
       ws.onerror = (evt: Event) => {
-        if (isUnmountedRef.current) return;
+        if (isUnmountedRef.current || wsRef.current !== ws) return;
         console.warn('WebSocket connection error:', evt);
         setConnectionError('Connection interrupted. Unable to reach interview server.');
         onErrorRef.current?.(evt);
       };
 
       ws.onclose = (evt: CloseEvent) => {
-        if (isUnmountedRef.current) return;
+        if (isUnmountedRef.current || wsRef.current !== ws) return;
         setIsConnected(false);
         setIsConnecting(false);
         clearHeartbeat();

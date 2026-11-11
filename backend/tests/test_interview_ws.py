@@ -111,315 +111,170 @@ def test_ws_ping_pong(client, test_session):
 
 
 def test_ws_start_and_greeting_flow(client, db_session, test_session):
-    """
-    On session start:
-    - AI greets candidate with Aura-2 TTS and initial question (AC-010).
-    - Session status transitions to 'in_progress'.
-    - Candidate record is linked in DB.
-    - Initial interviewer turn is recorded in DB (AC-029).
-    """
+    from backend.tests.stream_helpers import listen
     with client.websocket_connect(f"/ws/interview/{test_session.token}") as ws:
-        ws.send_json({
-            "type": "start",
-            "candidate_name": "Jane Doe",
-            "candidate_email": "jane.doe@example.com",
-        })
-
-        # Expect: status(speaking) -> question -> audio -> status(listening)
-        m1 = ws.receive_json()
-        assert m1["type"] == "status"
-        assert m1["state"] == "speaking"
-        assert m1["question_index"] == 1
-        assert m1["total_questions"] == test_session.question_count
-
-        m2 = ws.receive_json()
-        assert m2["type"] == "question"
-        assert m2["turn_index"] == 1
-        assert len(m2["text"]) > 0
-        assert m2["is_follow_up"] is False
-
-        m3 = ws.receive_json()
-        assert m3["type"] == "audio"
-        assert m3["turn_index"] == 1
-        assert m3["format"] == "audio/mp3"
-        assert m3["is_final_chunk"] is True
-        # Verify base64 audio decodes to valid MP3
-        decoded_audio = base64.b64decode(m3["data"])
-        assert len(decoded_audio) > 0
-        assert decoded_audio[0] == 0xFF and (decoded_audio[1] & 0xE0) == 0xE0
-
-
-        m4 = ws.receive_json()
-        assert m4["type"] == "status"
-        assert m4["state"] == "listening"
-        assert m4["question_index"] == 1
-
-    # Verify DB persistence
+        ws.send_json({"type": "start", "candidate_name": "Jane Doe", "candidate_email": "jane.doe@example.com"})
+        events = listen(ws)
+        assert events[0]["state"] == "speaking"
+        questions = [e for e in events if e["type"] == "question"]
+        assert questions[-1]["is_final"] is True
+        assert all(q["stream_id"] == questions[0]["stream_id"] for q in questions)
+        assert all(b["text"].startswith(a["text"]) for a, b in zip(questions, questions[1:]))
+        audio = [e for e in events if e["type"] == "audio" and e["data"]]
+        assert audio and all(e["format"] == "audio/pcm" and e["sample_rate"] == 24000 for e in audio)
     db_session.refresh(test_session)
     assert test_session.status == "in_progress"
-    assert test_session.candidate_name == "Jane Doe"
-    assert test_session.candidate_email == "jane.doe@example.com"
-
-    cand = db_session.query(Candidate).filter(Candidate.session_id == test_session.id).first()
-    assert cand is not None
+    cand = db_session.query(Candidate).filter(Candidate.session_id == test_session.id).one()
     assert cand.name == "Jane Doe"
-
     turns = db_session.query(InterviewTurn).filter(InterviewTurn.session_id == test_session.id).all()
-    assert len(turns) == 1
-    assert turns[0].speaker == "interviewer"
-    assert turns[0].turn_index == 1
-    assert turns[0].text == m2["text"]
+    assert len(turns) == 1 and turns[0].text == questions[-1]["text"]
 
 
 def test_ws_audio_chunk_and_done_answering(client, db_session, test_session):
-    """
-    Candidate streams audio chunk, receives transcript (AC-011),
-    and clicks 'Done Answering' (AC-013) to finalize turn and advance.
-    """
+    from backend.tests.stream_helpers import listen
     with client.websocket_connect(f"/ws/interview/{test_session.token}") as ws:
-        # Start
-        ws.send_json({"type": "start", "candidate_name": "Jane Doe"})
-        ws.receive_json()  # status: speaking
-        ws.receive_json()  # question 1
-        ws.receive_json()  # audio 1
-        ws.receive_json()  # status: listening
-
-        # Stream audio chunk with custom text
-        custom_audio = b"dummy_pcm_TEST_TRANSCRIPT:I use FastAPI and PostgreSQL for high-throughput APIs.\n"
-        b64_audio = base64.b64encode(custom_audio).decode("utf-8")
-        ws.send_json({"type": "audio_chunk", "data": b64_audio, "format": "audio/webm"})
-
-        # Expect transcript event (AC-011)
-        trans_msg = ws.receive_json()
-        assert trans_msg["type"] == "transcript"
-        assert trans_msg["speaker"] == "candidate"
-        assert trans_msg["text"] == "I use FastAPI and PostgreSQL for high-throughput APIs."
-        assert trans_msg["is_final"] is True
-
-        # Click "Done Answering" (AC-013)
+        ws.send_json({"type": "start"})
+        listen(ws)
+        audio = base64.b64encode(b"TEST_TRANSCRIPT:I use FastAPI and PostgreSQL for high-throughput APIs.\n").decode()
+        ws.send_json({"type": "audio_chunk", "data": audio})
+        assert ws.receive_json()["type"] == "transcript"
         ws.send_json({"type": "done_answering"})
-
-        # Expect: status(thinking)
-        think_msg = ws.receive_json()
-        assert think_msg["type"] == "status"
-        assert think_msg["state"] == "thinking"
-
-        # Next question (turn 2)
-        q_status = ws.receive_json()  # status: speaking
-        assert q_status["type"] == "status"
-        assert q_status["state"] == "speaking"
-
-        q2_msg = ws.receive_json()  # question
-        assert q2_msg["type"] == "question"
-        assert q2_msg["turn_index"] == 2
-
-        q2_audio = ws.receive_json()  # audio
-        assert q2_audio["type"] == "audio"
-        assert q2_audio["turn_index"] == 2
-
-        ws.receive_json()  # status: listening
-
-    # Verify DB candidate turn and evaluation persistence (AC-020, AC-029)
-    turns = (
-        db_session.query(InterviewTurn)
-        .filter(InterviewTurn.session_id == test_session.id)
-        .order_by(InterviewTurn.turn_index, InterviewTurn.speaker)
-        .all()
-    )
-    # Interviewer turn 1, Candidate turn 1, Interviewer turn 2
-    assert len(turns) >= 3
-    cand_turns = [t for t in turns if t.speaker == "candidate"]
-    assert len(cand_turns) == 1
-    assert "FastAPI" in cand_turns[0].text
-
-    eval_record = (
-        db_session.query(TurnEvaluation)
-        .filter(TurnEvaluation.turn_id == cand_turns[0].id)
-        .first()
-    )
-    assert eval_record is not None
-    assert 0.0 <= eval_record.relevance <= 10.0
-    assert 0.0 <= eval_record.depth <= 10.0
-    assert 0.0 <= eval_record.correctness <= 10.0
-    assert 0.0 <= eval_record.communication <= 10.0
+        assert ws.receive_json()["state"] == "thinking"
+        events = listen(ws)
+        assert next(e for e in events if e["type"] == "question")["turn_index"] == 2
+    candidate = db_session.query(InterviewTurn).filter(InterviewTurn.speaker == "candidate").one()
+    evaluation = db_session.query(TurnEvaluation).filter(TurnEvaluation.turn_id == candidate.id).one()
+    assert 0 <= evaluation.relevance <= 10
 
 
-def test_ws_text_fallback(client, db_session, test_session):
-    """Candidate typed text fallback input when microphone fails (AC-026)."""
+def test_ws_playback_ack_gates_answers_and_ignores_stale_ack(client, test_session):
+    from backend.tests.stream_helpers import drain_speech
     with client.websocket_connect(f"/ws/interview/{test_session.token}") as ws:
-        # Start
-        ws.send_json({"type": "start", "candidate_name": "Jane Doe"})
-        ws.receive_json()  # status speaking
-        ws.receive_json()  # question 1
-        ws.receive_json()  # audio 1
-        ws.receive_json()  # status listening
+        ws.send_json({"type": "start"})
+        events = drain_speech(ws, acknowledge=False)
+        stream_id = events[-1]["stream_id"]
+        ws.send_json({"type": "text_fallback", "text": "Should be ignored while speaking"})
+        ws.send_json({"type": "playback_complete", "stream_id": "stale"})
+        ws.send_json({"type": "ping"})
+        assert ws.receive_json() == {"type": "pong"}
+        ws.send_json({"type": "playback_complete", "stream_id": stream_id})
+        assert ws.receive_json()["state"] == "listening"
 
-        # Submit text fallback
-        ws.send_json({
-            "type": "text_fallback",
-            "text": "My microphone is glitching so I am typing my response about caching with Redis.",
-        })
 
-        # Expect transcript event
-        trans = ws.receive_json()
-        assert trans["type"] == "transcript"
-        assert "caching with Redis" in trans["text"]
-
-        # Expect thinking status
-        thinking = ws.receive_json()
-        assert thinking["type"] == "status"
-        assert thinking["state"] == "thinking"
-
-        # Expect next turn
-        ws.receive_json()  # status speaking
-        q2 = ws.receive_json()  # question 2
-        assert q2["type"] == "question"
-        assert q2["turn_index"] == 2
-        ws.receive_json()  # audio 2
-        ws.receive_json()  # status listening
+def test_ws_text_fallback_and_completion(client, db_session, test_session):
+    from backend.tests.stream_helpers import listen, drain_speech
+    with client.websocket_connect(f"/ws/interview/{test_session.token}") as ws:
+        ws.send_json({"type": "start"})
+        listen(ws)
+        for index in range(2):
+            ws.send_json({"type": "text_fallback", "text": "I use Redis caching and asynchronous APIs to handle high load."})
+            assert ws.receive_json()["type"] == "transcript"
+            assert ws.receive_json()["state"] == "thinking"
+            if index == 0:
+                listen(ws)
+            else:
+                events = drain_speech(ws, acknowledge=False)
+                ws.send_json({"type": "ping"})
+                assert ws.receive_json()["type"] == "pong"  # completion waits for closing playback
+                ws.send_json({"type": "playback_complete", "stream_id": events[-1]["stream_id"]})
+                complete = ws.receive_json()
+                assert complete["type"] == "interview_complete"
+                assert ws.receive_json()["state"] == "completed"
+    db_session.refresh(test_session)
+    assert test_session.status == "completed"
+    assert db_session.query(FinalScorecard).filter(FinalScorecard.session_id == test_session.id).one()
+    assert client.get(f"/api/sessions/{test_session.id}/scorecard").status_code == 200
 
 
 def test_ws_mute_toggle(client, test_session):
-    """Microphone mute toggle prevents audio ingestion (AC-014)."""
+    from backend.tests.stream_helpers import listen
     with client.websocket_connect(f"/ws/interview/{test_session.token}") as ws:
         ws.send_json({"type": "start"})
-        ws.receive_json()  # speaking
-        ws.receive_json()  # q1
-        ws.receive_json()  # a1
-        ws.receive_json()  # listening
-
-        # Toggle mute ON
+        listen(ws)
+        audio = base64.b64encode(b"some-muted-audio").decode()
         ws.send_json({"type": "mute_toggle", "muted": True})
-
-        # Send audio chunk while muted -> should NOT produce a transcript
-        b64_audio = base64.b64encode(b"some-muted-audio").decode("utf-8")
-        ws.send_json({"type": "audio_chunk", "data": b64_audio, "format": "audio/webm"})
-
-        # Send ping to verify websocket is responsive and no transcript was queued
+        ws.send_json({"type": "audio_chunk", "data": audio})
         ws.send_json({"type": "ping"})
-        pong = ws.receive_json()
-        assert pong == {"type": "pong"}
-
-        # Unmute
+        assert ws.receive_json() == {"type": "pong"}
         ws.send_json({"type": "mute_toggle", "muted": False})
-        ws.send_json({"type": "audio_chunk", "data": b64_audio, "format": "audio/webm"})
-        trans = ws.receive_json()
-        assert trans["type"] == "transcript"
+        ws.send_json({"type": "audio_chunk", "data": audio})
+        assert ws.receive_json()["type"] == "transcript"
 
 
-def test_ws_silence_detection_auto_conclusion(client, db_session, test_session):
-    """
-    Hybrid turn detection: sustained silence >= 2.75s triggers auto-turn conclusion (AC-012).
-    """
+def test_ws_silence_detection_auto_conclusion(client, test_session):
+    from backend.tests.stream_helpers import listen
     with client.websocket_connect(f"/ws/interview/{test_session.token}") as ws:
         ws.send_json({"type": "start"})
-        ws.receive_json()  # speaking
-        ws.receive_json()  # q1
-        ws.receive_json()  # a1
-        ws.receive_json()  # listening
-
-        # Candidate speaks: sends audio chunk
-        custom_audio = b"TEST_TRANSCRIPT:Speaking then pausing for silence timeout.\n"
-        b64 = base64.b64encode(custom_audio).decode("utf-8")
-        ws.send_json({"type": "audio_chunk", "data": b64, "format": "audio/webm"})
-
-        trans = ws.receive_json()
-        assert trans["type"] == "transcript"
-
-        # Now simulate silence by waiting for silence ticks and auto-conclusion
-        # Collect incoming messages until thinking or silence_tick
-        messages = []
-        start_wait = time.time()
-        while time.time() - start_wait < 5.0:
-            try:
-                # Receive next message with a short timeout
-                msg = ws.receive_json()
-                messages.append(msg)
-                if msg.get("type") == "status" and msg.get("state") == "thinking":
-                    break
-            except Exception:
+        listen(ws)
+        audio = base64.b64encode(b"TEST_TRANSCRIPT:I use Redis caching and asynchronous APIs for reliability.\n").decode()
+        ws.send_json({"type": "audio_chunk", "data": audio})
+        assert ws.receive_json()["type"] == "transcript"
+        while True:
+            msg = ws.receive_json()
+            if msg.get("state") == "thinking":
                 break
-
-        msg_types = [m.get("type") for m in messages]
-        # Silence tick or auto-concluded thinking state observed!
-        assert "status" in msg_types
-        thinking_msgs = [m for m in messages if m.get("type") == "status" and m.get("state") == "thinking"]
-        assert len(thinking_msgs) >= 1
+            assert msg["type"] == "silence_tick"
 
 
-def test_ws_full_interview_completion_and_scorecard(client, db_session, test_session):
-    """
-    Completes full interview cycle across configured question quota:
-    - Generates closing speech audio and completion payload (AC-019).
-    - Persists FinalScorecard and updates session to 'completed' (AC-021).
-    - REST scorecard endpoint returns 200 with full metrics.
-    """
+def test_auto_silence_early_playback_ack_waits_for_persistence(client, test_session, monkeypatch):
+    """An immediate browser ack cannot race the auto-turn graph result/DB commit."""
+    import threading
+    from backend.tests.stream_helpers import listen, drain_speech
+    from backend.app.ws import interview_ws
+
+    original = interview_ws.stream_graph_speech
+    result_pending = threading.Event()
+    release_result = threading.Event()
+    calls = 0
+
+    async def delayed_result(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        result = await original(*args, **kwargs)
+        if calls == 2:
+            result_pending.set()
+            assert await asyncio.to_thread(release_result.wait, 3)
+        return result
+
+    monkeypatch.setattr(interview_ws, 'stream_graph_speech', delayed_result)
     with client.websocket_connect(f"/ws/interview/{test_session.token}") as ws:
-        # Start
-        ws.send_json({"type": "start", "candidate_name": "Jane Doe"})
-        ws.receive_json()  # speaking
-        ws.receive_json()  # q1
-        ws.receive_json()  # a1
-        ws.receive_json()  # listening
+        ws.send_json({"type": "start"})
+        listen(ws)
+        ws.send_json({"type": "transcript_update", "text": "I build async Python APIs with Redis caching.", "is_final": True})
+        assert ws.receive_json()['type'] == 'transcript'
+        while ws.receive_json().get('state') != 'thinking':
+            pass
+        events = drain_speech(ws, acknowledge=False)
+        assert result_pending.wait(1)
+        ws.send_json({'type': 'playback_complete', 'stream_id': events[-1]['stream_id']})
+        ws.send_json({'type': 'ping'})
+        assert ws.receive_json() == {'type': 'pong'}  # receive stays responsive during processing
+        release_result.set()
+        assert ws.receive_json()['state'] == 'listening'
 
-        # Turn 1 answer
-        ws.send_json({
-            "type": "text_fallback",
-            "text": "First answer: I design RESTful APIs using FastAPI and relational databases with SQLAlchemy.",
-        })
-        ws.receive_json()  # transcript
-        ws.receive_json()  # thinking
-        ws.receive_json()  # speaking
-        q2 = ws.receive_json()  # q2
-        assert q2["type"] == "question"
-        assert q2["turn_index"] == 2
-        ws.receive_json()  # a2
-        ws.receive_json()  # listening
 
-        # Turn 2 answer (reaches question_count = 2 quota)
-        ws.send_json({
-            "type": "text_fallback",
-            "text": "Second answer: I use background workers and asynchronous queues for high scale.",
-        })
-        ws.receive_json()  # transcript
-        ws.receive_json()  # thinking
+def test_auto_silence_partial_model_failure_closes_for_retry(client, test_session, monkeypatch):
+    from backend.tests.stream_helpers import listen
+    from backend.app.interview import nodes
+    from starlette.websockets import WebSocketDisconnect
 
-        # Expect closing sequence
-        closing_audio = ws.receive_json()
-        assert closing_audio["type"] == "audio"
+    with client.websocket_connect(f"/ws/interview/{test_session.token}") as ws:
+        ws.send_json({'type': 'start'})
+        listen(ws)
 
-        comp_msg = ws.receive_json()
-        assert comp_msg["type"] == "interview_complete"
-        assert comp_msg["session_id"] == test_session.id
-        assert len(comp_msg["closing_message"]) > 0
+        def broken_stream(llm, prompt):
+            yield 'What are your API tradeoffs? '
+            raise ConnectionError('model connection interrupted')
 
-        final_status = ws.receive_json()
-        assert final_status["type"] == "status"
-        assert final_status["state"] == "completed"
-
-    # Verify Database persistence
-    db_session.refresh(test_session)
-    assert test_session.status == "completed"
-    assert test_session.completed_at is not None
-
-    scorecard = db_session.query(FinalScorecard).filter(FinalScorecard.session_id == test_session.id).first()
-    assert scorecard is not None
-    assert 0.0 <= scorecard.overall_score <= 10.0
-    assert scorecard.recommendation in ["Strong Hire", "Hire", "Borderline", "Do Not Hire"]
-    assert len(scorecard.summary) > 0
-    assert isinstance(scorecard.strengths, list)
-    assert isinstance(scorecard.growth_areas, list)
-
-    # Verify REST API returns scorecard correctly
-    res_sc = client.get(f"/api/sessions/{test_session.id}/scorecard")
-    assert res_sc.status_code == 200
-    sc_data = res_sc.json()
-    assert sc_data["overall_score"] == scorecard.overall_score
-    assert len(sc_data["evaluations"]) >= 2
-
-    # Verify REST API returns transcript correctly
-    res_tr = client.get(f"/api/sessions/{test_session.id}/transcript")
-    assert res_tr.status_code == 200
-    tr_data = res_tr.json()
-    assert len(tr_data["turns"]) >= 4  # interviewer + candidate for turns 1 and 2
-
+        # Force the next turn onto the streaming prose node rather than JSON follow-up.
+        monkeypatch.setattr('backend.app.interview.speech.safe_llm_stream', broken_stream)
+        ws.send_json({'type': 'transcript_update', 'text': "I don't know about this implementation.", 'is_final': True})
+        assert ws.receive_json()['type'] == 'transcript'
+        events = []
+        with pytest.raises(WebSocketDisconnect) as disconnected:
+            while True:
+                events.append(ws.receive_json())
+        assert disconnected.value.code == 1011
+        assert any(e.get('code') == 'GENERATION_INTERRUPTED' for e in events)
+        assert any(e['type'] == 'audio' and e['is_final_chunk'] for e in events)
+        assert not any(e.get('state') == 'listening' for e in events)

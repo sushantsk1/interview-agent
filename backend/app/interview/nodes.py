@@ -4,7 +4,7 @@ import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from backend.app.interview.llm_factory import get_llm, safe_llm_invoke
+from backend.app.interview.llm_factory import get_llm, safe_llm_invoke, safe_llm_stream
 from backend.app.interview.prompts import (
     CLOSING_PROMPT,
     EVALUATION_PROMPT,
@@ -15,6 +15,7 @@ from backend.app.interview.prompts import (
     STEERING_PROMPT,
     TOPIC_GENERATION_PROMPT,
 )
+from backend.app.interview.speech import emit_speech, stream_prose
 from backend.app.interview.state import (
     DimensionScores,
     InterviewState,
@@ -59,7 +60,7 @@ def topic_generation_node(state: InterviewState) -> Dict[str, Any]:
         return {"topics": existing_topics, "current_topic_index": 0}
 
     job_title = state.get("job_title", "Software Engineer")
-    jd_text = state.get("jd_text", "")
+    jd_text = state.get("jd_text", "")[:12000]
     resume_text = state.get("resume_text") or "No resume provided."
     question_count = state.get("config", {}).get("question_count", 8)
     topic_count = max(3, min(5, question_count // 2 if question_count >= 6 else 3))
@@ -132,6 +133,7 @@ def greeting_node(state: InterviewState) -> Dict[str, Any]:
         "We'll cover your technical expertise, system design, and practical experience. Let's begin."
     )
 
+    emit_speech(state, greeting_text + " ", turn_index=1)
     messages = list(state.get("messages", []))
     msg: Message = {
         "role": "interviewer",
@@ -161,8 +163,8 @@ def ask_question_node(state: InterviewState) -> Dict[str, Any]:
     job_title = state.get("job_title", "Software Engineer")
     config = state.get("config", {})
     difficulty = config.get("difficulty", "Mid-level")
-    jd_text = state.get("jd_text", "")
-    resume_text = state.get("resume_text") or "None"
+    jd_text = state.get("jd_text", "")[:12000]
+    resume_text = (state.get("resume_text") or "None")[:8000]
 
     # Previous questions to prevent duplication
     prev_qs = [
@@ -183,8 +185,8 @@ def ask_question_node(state: InterviewState) -> Dict[str, Any]:
         previous_questions=previous_questions_str,
     )
 
-    llm = get_llm(temperature=0.5)
-    question_text = safe_llm_invoke(llm, prompt).strip()
+    llm = get_llm(temperature=0.5, max_tokens=120)
+    question_text = stream_prose(llm, prompt, state, follow_up=False)
 
     messages = list(state.get("messages", []))
     msg: Message = {
@@ -253,6 +255,7 @@ def steering_node(state: InterviewState) -> Dict[str, Any]:
         if not steering_text:
             steering_text = f"I appreciate your response, but let's keep our focus on the interview question: '{question}'. Could you please address that?"
 
+        emit_speech(state, steering_text, turn_index=state.get("current_turn_index", 1))
         messages = list(state.get("messages", []))
         msg: Message = {
             "role": "interviewer",
@@ -286,7 +289,7 @@ def evaluate_answer_node(state: InterviewState) -> Dict[str, Any]:
     question = state.get("current_question", "")
     candidate_answer = state.get("last_candidate_answer", "")
     job_title = state.get("job_title", "Software Engineer")
-    jd_text = state.get("jd_text", "")
+    jd_text = state.get("jd_text", "")[:12000]
 
     prompt = EVALUATION_PROMPT.format(
         job_title=job_title,
@@ -294,6 +297,7 @@ def evaluate_answer_node(state: InterviewState) -> Dict[str, Any]:
         question=question,
         candidate_answer=candidate_answer,
         jd_text=jd_text,
+        previous_questions="\n".join(m.get("content", "") for m in state.get("messages", []) if m.get("type") in {"question", "follow_up"}),
     )
 
     llm = get_llm(temperature=0.2)
@@ -339,6 +343,7 @@ def evaluate_answer_node(state: InterviewState) -> Dict[str, Any]:
     return {
         "evaluations": evaluations,
         "last_evaluation": eval_record,
+        "follow_up_proposal": {"needs_follow_up": parsed.get("needs_follow_up", False), "follow_up_question": parsed.get("follow_up_question", "")},
     }
 
 
@@ -392,7 +397,7 @@ def decide_next_node(state: InterviewState) -> Dict[str, Any]:
         job_title = state.get("job_title", "Software Engineer")
         difficulty = config.get("difficulty", "Mid-level")
         question = state.get("current_question", "")
-        jd_text = state.get("jd_text", "")
+        jd_text = state.get("jd_text", "")[:12000]
 
         prompt = FOLLOW_UP_PROMPT.format(
             job_title=job_title,
@@ -403,9 +408,10 @@ def decide_next_node(state: InterviewState) -> Dict[str, Any]:
             jd_text=jd_text,
         )
 
-        llm = get_llm(temperature=0.3)
-        response_text = safe_llm_invoke(llm, prompt)
-        parsed = parse_json_from_llm(response_text, {})
+        parsed = state.get("follow_up_proposal")
+        if parsed is None:
+            llm = get_llm(temperature=0.3)
+            parsed = parse_json_from_llm(safe_llm_invoke(llm, prompt), {})
 
         needs_follow_up = bool(parsed.get("needs_follow_up", False))
         follow_up_q = parsed.get("follow_up_question", "").strip()
@@ -434,6 +440,7 @@ def follow_up_node(state: InterviewState) -> Dict[str, Any]:
     Asks the adaptive follow-up question and increments follow_up_count (AC-016).
     """
     question_text = state.get("current_question", "")
+    emit_speech(state, question_text, follow_up=True)
     messages = list(state.get("messages", []))
 
     msg: Message = {
@@ -467,8 +474,8 @@ def closing_node(state: InterviewState) -> Dict[str, Any]:
         candidate_name=candidate_name,
     )
 
-    llm = get_llm(temperature=0.3)
-    closing_text = safe_llm_invoke(llm, prompt).strip()
+    llm = get_llm(temperature=0.3, max_tokens=160)
+    closing_text = stream_prose(llm, prompt, state, closing=True)
 
     messages = list(state.get("messages", []))
     msg: Message = {
@@ -526,7 +533,7 @@ def scorecard_node(state: InterviewState) -> Dict[str, Any]:
         overall_score=overall_score,
     )
 
-    llm = get_llm(temperature=0.2)
+    llm = get_llm(temperature=0.2, max_tokens=1000)
     response_text = safe_llm_invoke(llm, prompt)
     parsed = parse_json_from_llm(response_text, {})
 
