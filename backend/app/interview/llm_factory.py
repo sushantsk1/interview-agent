@@ -2,11 +2,13 @@ import json
 import logging
 import os
 import re
+import time
 from typing import Any, List, Optional
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import BaseMessage, AIMessage
 from langchain_core.outputs import ChatResult, ChatGeneration
 from backend.app.config import settings
+from backend.app.observability import log_event
 
 logger = logging.getLogger(__name__)
 
@@ -130,8 +132,8 @@ class MockChatModel(BaseChatModel):
 
             return json.dumps({
                 "needs_follow_up": True,
-                "reason": "Candidate outlined a good baseline architecture; exploring error handling and edge cases is warranted.",
-                "follow_up_question": "How would you handle failure recovery and ensure data consistency if one of those downstream services times out?"
+                "reason": "One practical detail in the answer is worth clarifying.",
+                "follow_up_question": "What was one step you took to check that it worked?"
             }, indent=2)
 
         # 4. 4-Dimension Evaluation prompt (AC-020)
@@ -247,18 +249,20 @@ class MockChatModel(BaseChatModel):
                 topic_name = m_t.group(1).strip()
 
             if "system design" in topic_name.lower() or "data" in topic_name.lower():
-                return "Can you walk me through how you would design a high-throughput event processing pipeline, including database persistence and cache invalidation strategies?"
+                return "How did you use a database in a recent project?"
             elif "production" in topic_name.lower() or "reliability" in topic_name.lower():
-                return "Could you describe a challenging production outage or performance bottleneck you diagnosed, how you identified the root cause, and how you fixed it?"
+                return "What did you do when a recent project had a bug?"
             elif "behavioral" in topic_name.lower() or "leadership" in topic_name.lower():
-                return "Tell me about a time you had a technical disagreement with a colleague regarding an architectural decision. How did you handle the discussion and reach consensus?"
+                return "Tell me about a time you worked with a teammate to solve a problem."
+            elif topic_name.lower() in ("role requirements & problem solving", "candidate experience"):
+                return "What is one relevant task you worked on recently?"
             else:
-                return f"In your experience with {topic_name}, how do you structure your code and services to ensure high availability, scalability, and maintainability?"
+                return f"What have you used {topic_name} for in a project?"
 
-        return "Could you elaborate on your experience in designing and delivering resilient backend systems?"
+        return "What is one project you enjoyed working on?"
 
 
-def get_llm(temperature: float = 0.3):
+def get_llm(temperature: float = 0.3, max_tokens: int = 400):
     """
     Returns ChatOpenAI pointed to NVIDIA NIM if NVIDIA_API_KEY is configured.
     Otherwise returns MockChatModel for offline, zero-key development & testing (AC-028).
@@ -274,29 +278,34 @@ def get_llm(temperature: float = 0.3):
                 base_url="https://integrate.api.nvidia.com/v1",
                 model=settings.NVIDIA_MODEL,
                 temperature=temperature,
-                max_tokens=400,
-                timeout=15.0,
-                extra_body={"chat_template_kwargs": {"thinking": False}},
+                max_tokens=max_tokens,
+                timeout=10.0,
+                max_retries=0,
+                extra_body={"chat_template_kwargs": {"enable_thinking": False}},
             )
         except Exception as e:
-            logger.warning(f"Failed to initialize ChatOpenAI ({e}); falling back to MockChatModel.")
+            log_event(logger, logging.WARNING, "model_init_failed", stage="init", model=settings.NVIDIA_MODEL, error_type=type(e).__name__)
             return MockChatModel(temperature=temperature)
 
     return MockChatModel(temperature=temperature)
 
 
-def safe_llm_invoke(llm: Any, prompt: str) -> str:
+def safe_llm_invoke(llm: Any, prompt: str, stage: str = "unknown") -> str:
     """
     Safely invokes LLM with automatic fallback to MockChatModel if network/API fails (AC-028).
     """
+    started = time.perf_counter()
+    mock_mode = isinstance(llm, MockChatModel)
+    log_event(logger, logging.INFO, "model_started", stage=stage, model=settings.NVIDIA_MODEL, mock_mode=mock_mode)
     try:
         response = llm.invoke(prompt)
+        log_event(logger, logging.INFO, "model_completed", stage=stage, duration_ms=round((time.perf_counter() - started) * 1000, 1), mock_mode=mock_mode)
         if isinstance(response, str):
             return response
         if hasattr(response, "content"):
             return str(response.content)
         return str(response)
     except Exception as e:
-        logger.warning(f"LLM invocation failed: {e}. Executing graceful fallback (AC-028).")
+        log_event(logger, logging.WARNING, "model_fallback", stage=stage, model=settings.NVIDIA_MODEL, error_type=type(e).__name__, duration_ms=round((time.perf_counter() - started) * 1000, 1))
         mock = MockChatModel()
         return mock.generate_deterministic_response(prompt)

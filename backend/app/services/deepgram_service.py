@@ -3,12 +3,18 @@ import io
 import logging
 import os
 import struct
+import time
 import wave
 from typing import AsyncIterator, Optional, Tuple
 
 from backend.app.config import settings
+from backend.app.observability import log_event
 
 logger = logging.getLogger(__name__)
+
+
+class VoiceSynthesisError(RuntimeError):
+    """The configured speech provider could not produce playable audio."""
 
 
 def generate_synthetic_mp3(num_frames: int = 8) -> bytes:
@@ -48,12 +54,12 @@ class DeepgramVoiceService:
     def __init__(
         self,
         api_key: Optional[str] = None,
-        tts_model: str = "aura-2-asteria-en",
+        tts_model: Optional[str] = None,
         stt_model: str = "nova-3",
         mock_mode: Optional[bool] = None,
     ):
         self.api_key = api_key if api_key is not None else (settings.DEEPGRAM_API_KEY or "")
-        self.tts_model = tts_model
+        self.tts_model = tts_model or getattr(settings, "DEEPGRAM_TTS_MODEL", "flux-meena-en")
         self.stt_model = stt_model
         self._mock_mode = mock_mode
         self._client = None
@@ -82,10 +88,25 @@ class DeepgramVoiceService:
         if self._client is None and not self.is_mock_mode:
             try:
                 from deepgram import AsyncDeepgramClient
-                self._client = AsyncDeepgramClient(api_key=self.api_key)
+                from deepgram.environment import DeepgramClientEnvironment
+                region = settings.DEEPGRAM_REGION.strip().lower()
+                if region not in ("global", "in", "eu", "au"):
+                    log_event(logger, logging.WARNING, "deepgram_region_defaulted")
+                    region = "global"
+                if region == "global":
+                    self._client = AsyncDeepgramClient(api_key=self.api_key)
+                else:
+                    host = f"api.{region}.deepgram.com"
+                    default = DeepgramClientEnvironment.PRODUCTION
+                    environment = DeepgramClientEnvironment(
+                        base=f"https://{host}",
+                        production=f"wss://{host}",
+                        agent=default.agent,
+                        agent_rest=default.agent_rest,
+                    )
+                    self._client = AsyncDeepgramClient(api_key=self.api_key, environment=environment)
             except Exception as e:
-                logger.warning("Could not initialize AsyncDeepgramClient: %s. Enabling mock mode.", e)
-                self._mock_mode = True
+                log_event(logger, logging.ERROR, "deepgram_client_init_failed", error_type=type(e).__name__)
         return self._client
 
     async def synthesize_speech(
@@ -96,37 +117,57 @@ class DeepgramVoiceService:
     ) -> bytes:
         """
         Synthesizes text into audio bytes using Deepgram Aura-2 TTS (AC-010).
-        Falls back smoothly to synthetic audio if unconfigured or error occurs (AC-027).
+        Synthetic audio is reserved for explicit mock/offline mode (AC-027).
+        Configured provider failures raise VoiceSynthesisError so the UI can offer replay.
         """
         model = voice_model or self.tts_model
+        started = time.perf_counter()
+        log_event(logger, logging.INFO, "tts_started", stage="tts", model=model, region=settings.DEEPGRAM_REGION, mock_mode=self.is_mock_mode)
 
         if self.is_mock_mode:
-            logger.debug("Synthesizing speech in mock mode for text: %s", text[:40])
+            explicitly_mocked = self._mock_mode is True or os.getenv("MOCK_DEEPGRAM", "").lower() in ("true", "1", "yes")
+            if not explicitly_mocked:
+                log_event(logger, logging.WARNING, "tts_unavailable", stage="tts", error_type="MissingApiKey")
+                raise VoiceSynthesisError("Deepgram API key is not configured")
             if audio_format.endswith("wav"):
-                return generate_synthetic_wav(duration_sec=1.0)
-            return generate_synthetic_mp3(num_frames=8)
+                audio = generate_synthetic_wav(duration_sec=1.0)
+            else:
+                audio = generate_synthetic_mp3(num_frames=8)
+            log_event(logger, logging.INFO, "tts_completed", stage="tts", bytes=len(audio), duration_ms=round((time.perf_counter() - started) * 1000, 1), mock_mode=True)
+            return audio
 
         client = self._get_client()
         if client is None:
-            return generate_synthetic_mp3(num_frames=8)
+            log_event(logger, logging.ERROR, "tts_unavailable", stage="tts", error_type="ClientUnavailable")
+            raise VoiceSynthesisError("Deepgram client unavailable")
 
         try:
-            generator = client.speak.v1.audio.generate(
-                text=text,
-                model=model,
-                encoding="mp3",
-            )
+            if model.startswith("flux-"):
+                generator = client.speak.v2.audio.generate(
+                    text=text,
+                    model=model,
+                    encoding="mp3",
+                )
+            else:
+                generator = client.speak.v1.audio.generate(
+                    text=text,
+                    model=model,
+                    encoding="mp3",
+                )
             chunks = []
+            first_byte_ms = None
             async for chunk in generator:
+                if first_byte_ms is None and chunk:
+                    first_byte_ms = round((time.perf_counter() - started) * 1000, 1)
                 chunks.append(chunk)
             audio_bytes = b"".join(chunks)
             if not audio_bytes:
-                logger.warning("Deepgram TTS returned empty audio bytes; falling back to synthetic audio.")
-                return generate_synthetic_mp3(num_frames=8)
+                raise VoiceSynthesisError("Deepgram returned empty speech audio")
+            log_event(logger, logging.INFO, "tts_completed", stage="tts", model=model, region=settings.DEEPGRAM_REGION, bytes=len(audio_bytes), first_byte_ms=first_byte_ms, duration_ms=round((time.perf_counter() - started) * 1000, 1))
             return audio_bytes
         except Exception as e:
-            logger.warning("Deepgram TTS synthesis failed (%s); returning synthetic audio fallback.", e)
-            return generate_synthetic_mp3(num_frames=8)
+            log_event(logger, logging.ERROR, "tts_failed", stage="tts", model=model, region=settings.DEEPGRAM_REGION, error_type=type(e).__name__, duration_ms=round((time.perf_counter() - started) * 1000, 1))
+            raise VoiceSynthesisError("Deepgram speech synthesis failed") from e
 
     async def transcribe_audio(
         self,
@@ -144,6 +185,8 @@ class DeepgramVoiceService:
         if client is None:
             return self._generate_mock_transcript(audio_bytes)
 
+        started = time.perf_counter()
+        log_event(logger, logging.INFO, "stt_started", stage="stt", model=self.stt_model, region=settings.DEEPGRAM_REGION, bytes=len(audio_bytes))
         try:
             response = await client.listen.v1.media.transcribe_file(
                 request=audio_bytes,
@@ -153,10 +196,13 @@ class DeepgramVoiceService:
             if response.results and response.results.channels:
                 alternatives = response.results.channels[0].alternatives
                 if alternatives and alternatives[0].transcript:
-                    return alternatives[0].transcript.strip()
+                    result = alternatives[0].transcript.strip()
+                    log_event(logger, logging.INFO, "stt_completed", stage="stt", duration_ms=round((time.perf_counter() - started) * 1000, 1))
+                    return result
+            log_event(logger, logging.INFO, "stt_completed", stage="stt", duration_ms=round((time.perf_counter() - started) * 1000, 1))
             return ""
         except Exception as e:
-            logger.debug("Deepgram STT transcription note: %s", e)
+            log_event(logger, logging.WARNING, "stt_failed", stage="stt", error_type=type(e).__name__, duration_ms=round((time.perf_counter() - started) * 1000, 1))
             return self._generate_mock_transcript(audio_bytes)
 
     def _generate_mock_transcript(self, audio_bytes: bytes) -> str:

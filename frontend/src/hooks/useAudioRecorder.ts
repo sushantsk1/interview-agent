@@ -1,5 +1,7 @@
 ﻿import { useState, useEffect, useRef, useCallback } from 'react';
 
+import { logDiagnostic } from '../services/diagnostics';
+
 export interface UseAudioRecorderOptions {
   stream: MediaStream | null;
   isEnabled: boolean;
@@ -68,8 +70,9 @@ export function useAudioRecorder({
     if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
       try {
         mediaRecorderRef.current.stop();
-      } catch (err) {
-        console.warn('Error stopping MediaRecorder:', err);
+        logDiagnostic('info', 'media_recorder_stop');
+      } catch {
+        logDiagnostic('warn', 'media_recorder_failed', { error_code: 'RECORDER_STOP_FAILED' });
       }
     }
     mediaRecorderRef.current = null;
@@ -88,6 +91,7 @@ export function useAudioRecorder({
 
     if (typeof MediaRecorder === 'undefined') {
       const err = new Error('MediaRecorder is not supported in this environment');
+      logDiagnostic('warn', 'media_recorder_failed', { error_code: 'RECORDER_UNAVAILABLE' });
       setError(err.message);
       onErrorRef.current?.(err);
       return;
@@ -126,15 +130,15 @@ export function useAudioRecorder({
               }
             }
           };
-          reader.onerror = (readErr) => {
-            console.warn('FileReader error for audio chunk:', readErr);
+          reader.onerror = () => {
+            logDiagnostic('warn', 'media_recorder_failed', { error_code: 'CHUNK_READ_FAILED' });
           };
           reader.readAsDataURL(event.data);
         }
       };
 
       recorder.onerror = (recErr: Event) => {
-        console.error('MediaRecorder runtime error:', recErr);
+        logDiagnostic('warn', 'media_recorder_failed', { error_code: 'RECORDER_RUNTIME_FAILED' });
         setError('MediaRecorder encountered an error');
         onErrorRef.current?.(recErr);
         setIsRecording(false);
@@ -145,10 +149,11 @@ export function useAudioRecorder({
       };
 
       recorder.start(timeslice);
+      logDiagnostic('info', 'media_recorder_start');
       setIsRecording(true);
       setError(null);
     } catch (err) {
-      console.warn('Failed to initialize or start MediaRecorder:', err);
+      logDiagnostic('warn', 'media_recorder_failed', { error_code: 'RECORDER_START_FAILED' });
       setError(err instanceof Error ? err.message : 'Failed to start recording');
       onErrorRef.current?.(err);
       setIsRecording(false);

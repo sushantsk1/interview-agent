@@ -16,6 +16,7 @@ import {
   Loader2,
 } from 'lucide-react';
 import { createSession, uploadResume } from '../services/api';
+import { logDiagnostic } from '../services/diagnostics';
 import type { SessionMetadata } from '../types';
 
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
@@ -159,8 +160,8 @@ export const CreateSession: React.FC = () => {
       if (resumeFile) {
         try {
           await uploadResume(session.id, resumeFile);
-        } catch (uploadErr: unknown) {
-          console.error('Resume upload error:', uploadErr);
+        } catch {
+          logDiagnostic('warn', 'http_error', { operation: 'resume_upload', outcome: 'failure' });
           // Session was created; display error notice or note it
         }
       }

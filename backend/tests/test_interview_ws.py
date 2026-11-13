@@ -3,7 +3,9 @@ import base64
 import os
 import time
 import pytest
+import deepgram
 from starlette.testclient import TestClient
+from backend.app.config import settings
 
 from backend.app.models.db_models import (
     Candidate,
@@ -14,6 +16,8 @@ from backend.app.models.db_models import (
 )
 from backend.app.services.deepgram_service import (
     DeepgramVoiceService,
+    VoiceSynthesisError,
+    deepgram_service,
     generate_synthetic_mp3,
     generate_synthetic_wav,
 )
@@ -83,6 +87,91 @@ def test_deepgram_service_unit():
     asyncio.run(run_async_tests())
 
 
+def test_configured_deepgram_failure_is_not_replaced_with_silence(monkeypatch):
+    """A failed real TTS request must be visible to the WebSocket client."""
+    svc = DeepgramVoiceService(api_key="configured-key", mock_mode=False)
+
+    class FailingAudio:
+        async def generate(self, **_kwargs):
+            raise RuntimeError("provider unavailable")
+            yield b""  # pragma: no cover
+
+    class FakeClient:
+        speak = type("Speak", (), {"v1": type("V1", (), {"audio": FailingAudio()})()})()
+
+    monkeypatch.setattr(svc, "_get_client", lambda: FakeClient())
+    with pytest.raises(VoiceSynthesisError):
+        asyncio.run(svc.synthesize_speech("Can you describe your experience?"))
+
+
+def test_missing_deepgram_key_does_not_claim_to_speak(monkeypatch):
+    monkeypatch.delenv("MOCK_DEEPGRAM", raising=False)
+    svc = DeepgramVoiceService(api_key="")
+    with pytest.raises(VoiceSynthesisError):
+        asyncio.run(svc.synthesize_speech("Can you describe your experience?"))
+
+
+def test_deepgram_region_configures_rest_and_websocket_hosts(monkeypatch):
+    captured = {}
+
+    def fake_client(**kwargs):
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(settings, "DEEPGRAM_REGION", "in")
+    monkeypatch.setattr(deepgram, "AsyncDeepgramClient", fake_client)
+    svc = DeepgramVoiceService(api_key="configured-key", mock_mode=False)
+    svc._get_client()
+    assert captured["environment"].base == "https://api.in.deepgram.com"
+    assert captured["environment"].production == "wss://api.in.deepgram.com"
+
+
+def test_deepgram_init_failure_never_switches_replay_to_silent_mock(monkeypatch):
+    def fail_client(**_kwargs):
+        raise RuntimeError("SDK initialization failed")
+
+    monkeypatch.setattr(deepgram, "AsyncDeepgramClient", fail_client)
+    svc = DeepgramVoiceService(api_key="configured-key", mock_mode=False)
+    for _ in range(2):
+        with pytest.raises(VoiceSynthesisError):
+            asyncio.run(svc.synthesize_speech("Please speak this question"))
+        assert svc.is_mock_mode is False
+
+
+def test_ws_tts_failure_can_replay_current_question_without_duplicate(client, db_session, test_session, monkeypatch):
+    attempts = 0
+
+    async def synthesize_once_failed(_text):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise VoiceSynthesisError("unavailable")
+        return generate_synthetic_mp3()
+
+    monkeypatch.setattr(deepgram_service, "synthesize_speech", synthesize_once_failed)
+
+    with client.websocket_connect(f"/ws/interview/{test_session.token}") as ws:
+        ws.send_json({"type": "start", "candidate_name": "Jane Doe"})
+        assert ws.receive_json()["state"] == "thinking"
+        assert ws.receive_json()["state"] == "speaking"
+        first_question = ws.receive_json()
+        assert first_question["type"] == "question"
+        error = ws.receive_json()
+        assert error["type"] == "error" and error["code"] == "TTS_FAILED"
+        assert error["turn_index"] == 1
+        assert ws.receive_json()["state"] == "listening"
+
+        ws.send_json({"type": "replay_question"})
+        assert ws.receive_json()["state"] == "speaking"
+        replay_audio = ws.receive_json()
+        assert replay_audio["type"] == "audio"
+        assert replay_audio["turn_index"] == first_question["turn_index"]
+        assert ws.receive_json()["state"] == "listening"
+
+    turns = db_session.query(InterviewTurn).filter(InterviewTurn.session_id == test_session.id).all()
+    assert len([turn for turn in turns if turn.speaker == "interviewer"]) == 1
+
+
 def test_ws_connection_invalid_token(client):
     """Connecting with an invalid token returns SESSION_NOT_FOUND error and closes (CONTRACT 3.2)."""
     with client.websocket_connect("/ws/interview/non_existent_token") as ws:
@@ -125,7 +214,9 @@ def test_ws_start_and_greeting_flow(client, db_session, test_session):
             "candidate_email": "jane.doe@example.com",
         })
 
-        # Expect: status(speaking) -> question -> audio -> status(listening)
+        # Expect: status(thinking) -> speaking -> question -> audio -> listening
+        preparing = ws.receive_json()
+        assert preparing["type"] == "status" and preparing["state"] == "thinking"
         m1 = ws.receive_json()
         assert m1["type"] == "status"
         assert m1["state"] == "speaking"
@@ -179,6 +270,7 @@ def test_ws_audio_chunk_and_done_answering(client, db_session, test_session):
     with client.websocket_connect(f"/ws/interview/{test_session.token}") as ws:
         # Start
         ws.send_json({"type": "start", "candidate_name": "Jane Doe"})
+        ws.receive_json()  # status: thinking
         ws.receive_json()  # status: speaking
         ws.receive_json()  # question 1
         ws.receive_json()  # audio 1
@@ -249,6 +341,7 @@ def test_ws_text_fallback(client, db_session, test_session):
     with client.websocket_connect(f"/ws/interview/{test_session.token}") as ws:
         # Start
         ws.send_json({"type": "start", "candidate_name": "Jane Doe"})
+        ws.receive_json()  # status thinking
         ws.receive_json()  # status speaking
         ws.receive_json()  # question 1
         ws.receive_json()  # audio 1
@@ -283,6 +376,7 @@ def test_ws_mute_toggle(client, test_session):
     """Microphone mute toggle prevents audio ingestion (AC-014)."""
     with client.websocket_connect(f"/ws/interview/{test_session.token}") as ws:
         ws.send_json({"type": "start"})
+        ws.receive_json()  # thinking
         ws.receive_json()  # speaking
         ws.receive_json()  # q1
         ws.receive_json()  # a1
@@ -313,6 +407,7 @@ def test_ws_silence_detection_auto_conclusion(client, db_session, test_session):
     """
     with client.websocket_connect(f"/ws/interview/{test_session.token}") as ws:
         ws.send_json({"type": "start"})
+        ws.receive_json()  # thinking
         ws.receive_json()  # speaking
         ws.receive_json()  # q1
         ws.receive_json()  # a1
@@ -357,6 +452,7 @@ def test_ws_full_interview_completion_and_scorecard(client, db_session, test_ses
     with client.websocket_connect(f"/ws/interview/{test_session.token}") as ws:
         # Start
         ws.send_json({"type": "start", "candidate_name": "Jane Doe"})
+        ws.receive_json()  # thinking
         ws.receive_json()  # speaking
         ws.receive_json()  # q1
         ws.receive_json()  # a1

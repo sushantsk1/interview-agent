@@ -2,7 +2,7 @@ TOPIC_GENERATION_PROMPT = """You are an expert technical interviewer and talent 
 Analyze the following Job Description and Candidate Resume (if provided) for the role of "{job_title}".
 Derive between 3 and 5 core competency topics that should be assessed in this interview.
 Ensure a balanced mix of:
-- Technical Skills & Architecture (direct requirements from the JD)
+- Practical technical skills (direct requirements from the JD)
 - Hands-on Experience & Problem Solving (practical execution, projects)
 - Behavioral, Collaboration & Production Practices (communication, trade-offs, reliability)
 
@@ -35,7 +35,7 @@ Output only the greeting text.
 """
 
 QUESTION_GENERATION_PROMPT = """You are an expert technical interviewer conducting an interview for "{job_title}".
-Difficulty Level: {difficulty}
+Candidate experience level (conservative, capped by recruiter setting): {difficulty}
 Current Topic: {topic_name} ({topic_type})
 Topic Description: {topic_description}
 
@@ -48,9 +48,12 @@ Candidate Resume Experience:
 Previous questions asked in this interview:
 {previous_questions}
 
-Generate one clear, engaging, open-ended question for this topic tailored to the candidate's background and {difficulty} difficulty.
+Generate one clear, engaging, open-ended question for this topic. Use one concrete JD skill or one actual resume experience when available.
+Ask about a practical task, project, or basic use of that skill. If the resume is missing or ambiguous, start with a simple question.
+Do not infer the candidate's skill level from the JD. Keep a Senior candidate's question practical and easy to understand too.
 Do NOT repeat previously asked questions.
-Keep the question concise and spoken naturally (1 to 2 sentences maximum). Do NOT include any preamble, bullet points, multiple choice options, or multiple questions.
+Use one concept in one short sentence, at most 20 words. Do not ask for architecture design, edge cases, trade-offs, or several steps unless the candidate's resume specifically shows that work and the topic requires it.
+Do NOT include any preamble, bullet points, multiple choice options, or multiple questions.
 
 Output only the single question text.
 """
@@ -80,7 +83,7 @@ Output strictly valid JSON with no markdown fences:
 
 FOLLOW_UP_PROMPT = """You are an expert technical interviewer assessing a candidate for "{job_title}".
 Current Topic: {topic_name}
-Difficulty Level: {difficulty}
+Candidate experience level: {difficulty}
 Question Asked:
 "{question}"
 
@@ -90,11 +93,15 @@ Candidate Answer:
 Job Description Context:
 {jd_text}
 
+Candidate Resume Experience:
+{resume_text}
+
 Decide whether an adaptive follow-up question is warranted:
 - If the candidate explicitly said "I don't know", "I haven't used this", or gave a complete non-answer: do NOT ask a follow-up; set needs_follow_up = false.
-- If the candidate provided a sound initial answer but left out important edge cases, trade-offs, architecture decisions, or practical implementation details: set needs_follow_up = true and write a focused follow-up question.
+- If the candidate gave a relevant answer with one practical detail worth clarifying, ask about that single detail at their experience level.
+- Do not automatically escalate to architecture, edge cases, or trade-offs. Do not assume the JD proves the candidate has advanced experience.
 - If the candidate's answer is already exceptionally thorough and complete: set needs_follow_up = false.
-Keep any follow-up question concise (1 to 2 sentences maximum) and spoken naturally without preamble.
+Keep a follow-up to one short question of at most 20 words, spoken naturally without preamble.
 
 Output strictly valid JSON with no markdown fences:
 {{
@@ -106,6 +113,7 @@ Output strictly valid JSON with no markdown fences:
 
 EVALUATION_PROMPT = """You are an objective hiring assessor evaluating a candidate's answer for "{job_title}".
 Topic: {topic_name}
+Candidate experience level: {difficulty}
 Question Asked:
 "{question}"
 
@@ -117,8 +125,8 @@ Job Description Context:
 
 Score the answer strictly across these 4 dimensions on a scale from 0.0 to 10.0:
 1. Relevance (0-10): Did the candidate directly address the specific question asked? (If candidate said "I don't know", rate honestly 3.0-5.0 for directness, but 0-2 if evasive/rambling).
-2. Depth (0-10): Did the candidate demonstrate practical understanding, technical depth, real-world examples, or edge case handling? (1.0-2.0 if "I don't know").
-3. Correctness (0-10): Are the technical facts, architecture patterns, and reasoning accurate? (1.0-2.0 if "I don't know").
+2. Depth (0-10): Did the candidate give enough practical detail for the question and their experience level? Do not require advanced architecture when it was not asked. (1.0-2.0 if "I don't know").
+3. Correctness (0-10): Are the facts and reasoning relevant to the question accurate? Judge at the stated experience level. (1.0-2.0 if "I don't know").
 4. Communication (0-10): Was the response clear, articulate, and well-structured?
 
 Also provide a concise 1-2 sentence qualitative rationale in "feedback".

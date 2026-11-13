@@ -30,8 +30,39 @@ vi.mock('../hooks/useMediaStream', () => ({
 describe('InterviewRoom Component (AC-008 to AC-014, AC-022, AC-026)', () => {
   let mockWsInstances: MockWebSocket[] = [];
   let originalWebSocket: typeof WebSocket;
+  let originalAudio: typeof Audio;
+  let mockAudioInstances: MockAudio[] = [];
+  let rejectNextAudioPlay = false;
+  let rejectNextAudioDecode = false;
+
+  class MockAudio {
+    src: string;
+    onended: (() => void) | null = null;
+    onerror: (() => void) | null = null;
+    play = vi.fn().mockImplementation(() => {
+      if (rejectNextAudioDecode) {
+        rejectNextAudioDecode = false;
+        return Promise.reject(new DOMException('Invalid MP3', 'NotSupportedError'));
+      }
+      if (rejectNextAudioPlay) {
+        rejectNextAudioPlay = false;
+        return Promise.reject(new DOMException('Autoplay blocked', 'NotAllowedError'));
+      }
+      return Promise.resolve();
+    });
+    pause = vi.fn();
+
+    constructor(src: string) {
+      this.src = src;
+      mockAudioInstances.push(this);
+    }
+  }
 
   class MockWebSocket {
+    static CONNECTING = 0;
+    static OPEN = 1;
+    static CLOSING = 2;
+    static CLOSED = 3;
     url: string;
     readyState: number = WebSocket.CONNECTING;
     onopen: ((event: any) => void) | null = null;
@@ -84,13 +115,19 @@ describe('InterviewRoom Component (AC-008 to AC-014, AC-022, AC-026)', () => {
 
   beforeEach(() => {
     mockWsInstances = [];
+    mockAudioInstances = [];
+    rejectNextAudioPlay = false;
+    rejectNextAudioDecode = false;
     originalWebSocket = window.WebSocket;
+    originalAudio = window.Audio;
     (window as any).WebSocket = MockWebSocket;
+    (window as any).Audio = MockAudio;
     vi.spyOn(api, 'fetchSessionByToken').mockResolvedValue(mockSession);
   });
 
   afterEach(() => {
     (window as any).WebSocket = originalWebSocket;
+    (window as any).Audio = originalAudio;
     vi.clearAllMocks();
   });
 
@@ -151,9 +188,190 @@ describe('InterviewRoom Component (AC-008 to AC-014, AC-022, AC-026)', () => {
         is_follow_up: false,
       });
     });
-
+    expect(screen.queryByText('How do you handle idempotent API requests?')).not.toBeInTheDocument();
+    expect(screen.getByRole('status')).toHaveTextContent('Preparing question and voice');
+    act(() => ws.triggerMessage({ type: 'audio', turn_index: 1, data: 'MP3_BYTES', format: 'audio/mp3', is_final_chunk: true }));
     expect(screen.getByText('How do you handle idempotent API requests?')).toBeInTheDocument();
     expect(screen.getByText('Distributed Systems')).toBeInTheDocument();
+  });
+
+  it('plays question audio as soon as it arrives and stays speaking until playback ends', async () => {
+    renderRoom();
+    await waitFor(() => expect(mockWsInstances.length).toBeGreaterThan(0));
+    const ws = mockWsInstances[0];
+    act(() => ws.triggerOpen());
+    act(() => {
+      ws.triggerMessage({ type: 'status', state: 'speaking', question_index: 1, total_questions: 5, time_elapsed_seconds: 0 });
+      ws.triggerMessage({ type: 'question', turn_index: 1, topic: 'APIs', text: 'How do you version an API?', is_follow_up: false });
+      ws.triggerMessage({ type: 'audio', turn_index: 1, data: 'MP3_BYTES', format: 'audio/mp3', is_final_chunk: true });
+      ws.triggerMessage({ type: 'status', state: 'listening', question_index: 1, total_questions: 5, time_elapsed_seconds: 0 });
+    });
+    await waitFor(() => expect(mockAudioInstances[0].play).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.getByText('Speaking')).toBeInTheDocument());
+    expect(screen.getByText('How do you version an API?')).toBeInTheDocument();
+    act(() => mockAudioInstances[0].onended?.());
+    await waitFor(() => expect(screen.getByText('Listening')).toBeInTheDocument());
+  });
+
+  it('keeps failed speech pending until the candidate retries or chooses text', async () => {
+    renderRoom();
+    await waitFor(() => expect(mockWsInstances.length).toBeGreaterThan(0));
+    const ws = mockWsInstances[0];
+    act(() => ws.triggerOpen());
+    act(() => {
+      ws.triggerMessage({ type: 'question', turn_index: 1, topic: 'APIs', text: 'How do you version an API?', is_follow_up: false });
+      ws.triggerMessage({ type: 'error', code: 'TTS_FAILED', message: 'Voice is temporarily unavailable.', turn_index: 1 });
+    });
+    expect(screen.queryByText('How do you version an API?')).not.toBeInTheDocument();
+    expect(screen.getByRole('alert')).toHaveTextContent('Voice is temporarily unavailable.');
+    expect(screen.getByText('Listening')).toBeInTheDocument();
+    fireEvent.click(screen.getAllByRole('button', { name: 'Play Question' })[0]);
+    expect(ws.sentMessages.map((message) => JSON.parse(message))).toContainEqual({ type: 'replay_question' });
+    act(() => ws.triggerMessage({ type: 'error', code: 'TTS_FAILED', message: 'Voice is still unavailable.', turn_index: 1 }));
+    fireEvent.click(screen.getByRole('button', { name: 'Read question instead' }));
+    expect(screen.getByText('How do you version an API?')).toBeInTheDocument();
+  });
+
+  it('keeps the read fallback available when a voice retry cannot be sent', async () => {
+    renderRoom();
+    await waitFor(() => expect(mockWsInstances.length).toBeGreaterThan(0));
+    const ws = mockWsInstances[0];
+    act(() => ws.triggerOpen());
+    act(() => {
+      ws.triggerMessage({ type: 'question', turn_index: 1, topic: 'APIs', text: 'Hidden question?', is_follow_up: false });
+      ws.triggerMessage({ type: 'error', code: 'TTS_FAILED', message: 'Voice unavailable', turn_index: 1 });
+      ws.triggerClose(1000);
+    });
+    fireEvent.click(screen.getAllByRole('button', { name: 'Play Question' })[0]);
+    expect(screen.getByRole('alert')).toHaveTextContent('Voice retry needs a connection');
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Read question instead' })).toBeEnabled();
+    expect(screen.queryByText('Hidden question?')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Read question instead' }));
+    expect(screen.getByText('Hidden question?')).toBeInTheDocument();
+  });
+
+  it('ignores audio for a prior turn while a new question waits for its own speech', async () => {
+    renderRoom();
+    await waitFor(() => expect(mockWsInstances.length).toBeGreaterThan(0));
+    const ws = mockWsInstances[0];
+    act(() => ws.triggerOpen());
+    act(() => {
+      ws.triggerMessage({ type: 'question', turn_index: 1, topic: 'APIs', text: 'First question?', is_follow_up: false });
+      ws.triggerMessage({ type: 'audio', turn_index: 1, data: 'FIRST_MP3', format: 'audio/mp3', is_final_chunk: true });
+    });
+    expect(screen.getByText('First question?')).toBeInTheDocument();
+    act(() => {
+      ws.triggerMessage({ type: 'question', turn_index: 2, topic: 'Systems', text: 'Second question?', is_follow_up: false });
+      ws.triggerMessage({ type: 'audio', turn_index: 1, data: 'STALE_MP3', format: 'audio/mp3', is_final_chunk: true });
+    });
+    expect(screen.queryByText('Second question?')).not.toBeInTheDocument();
+    expect(mockAudioInstances.length).toBe(1);
+    act(() => ws.triggerMessage({ type: 'audio', turn_index: 2, data: 'SECOND_MP3', format: 'audio/mp3', is_final_chunk: true }));
+    expect(screen.getByText('Second question?')).toBeInTheDocument();
+    expect(mockAudioInstances.length).toBe(2);
+  });
+
+  it('publishes same-turn steering only with the new matching audio and ignores duplicates', async () => {
+    renderRoom();
+    await waitFor(() => expect(mockWsInstances.length).toBeGreaterThan(0));
+    const ws = mockWsInstances[0];
+    act(() => ws.triggerOpen());
+    act(() => {
+      ws.triggerMessage({ type: 'question', turn_index: 1, topic: 'APIs', text: 'Original question?', is_follow_up: false });
+      ws.triggerMessage({ type: 'audio', turn_index: 1, data: 'ORIGINAL_MP3', format: 'audio/mp3', is_final_chunk: true });
+      ws.triggerMessage({ type: 'question', turn_index: 1, topic: 'APIs', text: 'Please answer the original question.', is_follow_up: false });
+    });
+    expect(screen.queryByText('Please answer the original question.')).not.toBeInTheDocument();
+    act(() => ws.triggerMessage({ type: 'audio', turn_index: 1, data: 'STEERING_MP3', format: 'audio/mp3', is_final_chunk: true }));
+    expect(screen.getByText('Please answer the original question.')).toBeInTheDocument();
+    act(() => ws.triggerMessage({ type: 'question', turn_index: 1, topic: 'APIs', text: 'Please answer the original question.', is_follow_up: false }));
+    expect(screen.getAllByText('Please answer the original question.')).toHaveLength(1);
+  });
+
+  it('requests audio for a resumed question before revealing it', async () => {
+    renderRoom();
+    await waitFor(() => expect(mockWsInstances.length).toBeGreaterThan(0));
+    const ws = mockWsInstances[0];
+    act(() => ws.triggerOpen());
+    act(() => {
+      ws.triggerMessage({ type: 'status', state: 'listening', question_index: 1, total_questions: 5, time_elapsed_seconds: 10 });
+      ws.triggerMessage({ type: 'question', turn_index: 1, topic: 'APIs', text: 'Resumed question?', is_follow_up: false });
+    });
+    expect(screen.queryByText('Resumed question?')).not.toBeInTheDocument();
+    expect(ws.sentMessages.map((message) => JSON.parse(message))).toContainEqual({ type: 'replay_question' });
+    act(() => ws.triggerMessage({ type: 'audio', turn_index: 1, data: 'RESUMED_MP3', format: 'audio/mp3', is_final_chunk: true }));
+    expect(screen.getByText('Resumed question?')).toBeInTheDocument();
+    act(() => ws.triggerMessage({ type: 'question', turn_index: 1, topic: 'APIs', text: 'Resumed question?', is_follow_up: false }));
+    expect(screen.getAllByText('Resumed question?')).toHaveLength(1);
+  });
+
+  it('offers a click to resume question audio when browser autoplay is blocked', async () => {
+    rejectNextAudioPlay = true;
+    renderRoom();
+    await waitFor(() => expect(mockWsInstances.length).toBeGreaterThan(0));
+    const ws = mockWsInstances[0];
+    act(() => ws.triggerOpen());
+    act(() => {
+      ws.triggerMessage({ type: 'question', turn_index: 1, topic: 'APIs', text: 'How do you version an API?', is_follow_up: false });
+      ws.triggerMessage({ type: 'audio', turn_index: 1, data: 'MP3_BYTES', format: 'audio/mp3', is_final_chunk: true });
+    });
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('browser paused interviewer audio'));
+    expect(screen.getByText('How do you version an API?')).toBeInTheDocument();
+    fireEvent.click(screen.getAllByRole('button', { name: 'Play Question' })[0]);
+    await waitFor(() => expect(mockAudioInstances[0].play).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.getByText('Speaking')).toBeInTheDocument());
+    expect(ws.sentMessages.map((message) => JSON.parse(message))).not.toContainEqual({ type: 'replay_question' });
+  });
+
+  it('requests fresh speech when the received MP3 cannot be decoded', async () => {
+    rejectNextAudioDecode = true;
+    renderRoom();
+    await waitFor(() => expect(mockWsInstances.length).toBeGreaterThan(0));
+    const ws = mockWsInstances[0];
+    act(() => ws.triggerOpen());
+    act(() => {
+      ws.triggerMessage({ type: 'question', turn_index: 1, topic: 'APIs', text: 'How do you version an API?', is_follow_up: false });
+      ws.triggerMessage({ type: 'audio', turn_index: 1, data: 'INVALID_MP3', format: 'audio/mp3', is_final_chunk: true });
+    });
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('audio could not play'));
+    fireEvent.click(screen.getAllByRole('button', { name: 'Play Question' })[0]);
+    expect(ws.sentMessages.map((message) => JSON.parse(message))).toContainEqual({ type: 'replay_question' });
+  });
+
+  it('completes the interview even if closing speech cannot play', async () => {
+    rejectNextAudioPlay = true;
+    renderRoom();
+    await waitFor(() => expect(mockWsInstances.length).toBeGreaterThan(0));
+    const ws = mockWsInstances[0];
+    act(() => ws.triggerOpen());
+    act(() => {
+      ws.triggerMessage({ type: 'audio', turn_index: 1, data: 'CLOSING_MP3', format: 'audio/mp3', is_final_chunk: true });
+      ws.triggerMessage({ type: 'interview_complete', session_id: 'session-xyz-123', closing_message: 'Thanks for interviewing.' });
+    });
+    await waitFor(() => expect(screen.getByText(/Thank You, Alex Rivera!/)).toBeInTheDocument());
+    expect(mockStopAllTracks).toHaveBeenCalled();
+  });
+
+  it('plays closing audio after the final answer before showing completion', async () => {
+    renderRoom();
+    await waitFor(() => expect(mockWsInstances.length).toBeGreaterThan(0));
+    const ws = mockWsInstances[0];
+    act(() => ws.triggerOpen());
+    act(() => {
+      ws.triggerMessage({ type: 'question', turn_index: 1, topic: 'APIs', text: 'Final question?', is_follow_up: false });
+      ws.triggerMessage({ type: 'audio', turn_index: 1, data: 'QUESTION_MP3', format: 'audio/mp3', is_final_chunk: true });
+    });
+    act(() => mockAudioInstances[0].onended?.());
+    act(() => {
+      ws.triggerMessage({ type: 'status', state: 'thinking', question_index: 1, total_questions: 1, time_elapsed_seconds: 20 });
+      ws.triggerMessage({ type: 'audio', turn_index: 1, data: 'CLOSING_MP3', format: 'audio/mp3', is_final_chunk: true });
+      ws.triggerMessage({ type: 'interview_complete', session_id: 'session-xyz-123', closing_message: 'Thanks for interviewing.' });
+    });
+    expect(mockAudioInstances[1].src).toContain('CLOSING_MP3');
+    expect(screen.queryByText(/Thank You, Alex Rivera!/)).not.toBeInTheDocument();
+    act(() => mockAudioInstances[1].onended?.());
+    expect(screen.getByText(/Thank You, Alex Rivera!/)).toBeInTheDocument();
   });
 
   it('displays real-time candidate transcript and finalized speech (AC-011)', async () => {
@@ -229,7 +447,10 @@ describe('InterviewRoom Component (AC-008 to AC-014, AC-022, AC-026)', () => {
     const ws = mockWsInstances[0];
     act(() => {
       ws.triggerOpen();
+      ws.triggerMessage({ type: 'question', turn_index: 1, topic: 'APIs', text: 'How do you version an API?', is_follow_up: false });
+      ws.triggerMessage({ type: 'audio', turn_index: 1, data: 'MP3_BYTES', format: 'audio/mp3', is_final_chunk: true });
     });
+    act(() => mockAudioInstances[0].onended?.());
 
     const doneButton = screen.getByText(/Done Answering \/ Next/i);
     fireEvent.click(doneButton);
@@ -268,7 +489,10 @@ describe('InterviewRoom Component (AC-008 to AC-014, AC-022, AC-026)', () => {
     const ws = mockWsInstances[0];
     act(() => {
       ws.triggerOpen();
+      ws.triggerMessage({ type: 'question', turn_index: 1, topic: 'APIs', text: 'How do you version an API?', is_follow_up: false });
+      ws.triggerMessage({ type: 'audio', turn_index: 1, data: 'MP3_BYTES', format: 'audio/mp3', is_final_chunk: true });
     });
+    act(() => mockAudioInstances[0].onended?.());
 
     // Open text fallback modal
     const fallbackBtn = screen.getByText(/Text Fallback/i);
@@ -290,6 +514,32 @@ describe('InterviewRoom Component (AC-008 to AC-014, AC-022, AC-026)', () => {
 
     // Chat should show typed answer
     expect(screen.getByText(/\[Typed\]: My fallback written explanation\./i)).toBeInTheDocument();
+  });
+
+  it('blocks answer actions while the current question remains hidden', async () => {
+    renderRoom();
+    await waitFor(() => expect(mockWsInstances.length).toBeGreaterThan(0));
+    const ws = mockWsInstances[0];
+    act(() => {
+      ws.triggerOpen();
+      ws.triggerMessage({ type: 'question', turn_index: 1, topic: 'APIs', text: 'First question?', is_follow_up: false });
+      ws.triggerMessage({ type: 'audio', turn_index: 1, data: 'FIRST_MP3', format: 'audio/mp3', is_final_chunk: true });
+    });
+    act(() => mockAudioInstances[0].onended?.());
+    fireEvent.click(screen.getByRole('button', { name: /Text Fallback/i }));
+    expect(screen.getByText(/Text Fallback Response/i)).toBeInTheDocument();
+    act(() => {
+      ws.triggerMessage({ type: 'question', turn_index: 2, topic: 'Systems', text: 'Hidden second question?', is_follow_up: false });
+      ws.triggerMessage({ type: 'error', code: 'TTS_FAILED', message: 'Voice unavailable', turn_index: 2 });
+    });
+    expect(screen.queryByText('Hidden second question?')).not.toBeInTheDocument();
+    expect(screen.queryByText(/Text Fallback Response/i)).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Text Fallback/i })).toBeDisabled();
+    expect(screen.getByRole('button', { name: /Done Answering/i })).toBeDisabled();
+    expect(ws.sentMessages.some((message) => JSON.parse(message).type === 'text_fallback')).toBe(false);
+    fireEvent.click(screen.getByRole('button', { name: 'Read question instead' }));
+    expect(screen.getByText('Hidden second question?')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Text Fallback/i })).toBeEnabled();
   });
 
   it('transitions to completion view with "View Results" button on interview_complete (AC-022)', async () => {

@@ -1,10 +1,11 @@
 ﻿import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { renderHook, act } from '@testing-library/react';
+import { renderHook, act, waitFor } from '@testing-library/react';
 import { useAudioPlayer } from '../hooks/useAudioPlayer';
 
 describe('useAudioPlayer hook (AC-009, AC-010)', () => {
   let originalAudio: typeof Audio;
   let audioInstances: any[] = [];
+  let rejectNextPlay = false;
 
   class MockAudio {
     src: string;
@@ -18,6 +19,10 @@ describe('useAudioPlayer hook (AC-009, AC-010)', () => {
     }
 
     play = vi.fn().mockImplementation(() => {
+      if (rejectNextPlay) {
+        rejectNextPlay = false;
+        return Promise.reject(new DOMException('Autoplay blocked', 'NotAllowedError'));
+      }
       this.paused = false;
       return Promise.resolve();
     });
@@ -29,6 +34,7 @@ describe('useAudioPlayer hook (AC-009, AC-010)', () => {
 
   beforeEach(() => {
     audioInstances = [];
+    rejectNextPlay = false;
     originalAudio = window.Audio;
     (window as any).Audio = MockAudio;
   });
@@ -56,7 +62,7 @@ describe('useAudioPlayer hook (AC-009, AC-010)', () => {
       result.current.queueAudio('BASE64_AUDIO_CHUNK_1', 'audio/mp3');
     });
 
-    expect(result.current.isPlaying).toBe(true);
+    await waitFor(() => expect(result.current.isPlaying).toBe(true));
     expect(onPlaybackStarted).toHaveBeenCalledTimes(1);
     expect(audioInstances.length).toBe(1);
     expect(audioInstances[0].src).toBe('data:audio/mp3;base64,BASE64_AUDIO_CHUNK_1');
@@ -79,7 +85,7 @@ describe('useAudioPlayer hook (AC-009, AC-010)', () => {
     });
 
     expect(audioInstances.length).toBe(1);
-    expect(result.current.isPlaying).toBe(true);
+    await waitFor(() => expect(result.current.isPlaying).toBe(true));
 
     // End chunk 1
     act(() => {
@@ -89,7 +95,7 @@ describe('useAudioPlayer hook (AC-009, AC-010)', () => {
     // Chunk 2 should now be playing
     expect(audioInstances.length).toBe(2);
     expect(audioInstances[1].src).toBe('data:audio/mp3;base64,CHUNK_2');
-    expect(result.current.isPlaying).toBe(true);
+    await waitFor(() => expect(result.current.isPlaying).toBe(true));
 
     // End chunk 2
     act(() => {
@@ -115,7 +121,7 @@ describe('useAudioPlayer hook (AC-009, AC-010)', () => {
       result.current.queueAudio('CHUNK_B');
     });
 
-    expect(result.current.isPlaying).toBe(true);
+    await waitFor(() => expect(result.current.isPlaying).toBe(true));
     expect(audioInstances[0].play).toHaveBeenCalled();
 
     act(() => {
@@ -126,5 +132,22 @@ describe('useAudioPlayer hook (AC-009, AC-010)', () => {
     expect(result.current.queueLength).toBe(0);
     expect(audioInstances[0].pause).toHaveBeenCalled();
     expect(onPlaybackEnded).toHaveBeenCalled();
+  });
+
+  it('keeps blocked audio available for a user-initiated retry', async () => {
+    const onError = vi.fn();
+    const onPlaybackEnded = vi.fn();
+    const { result } = renderHook(() => useAudioPlayer({ onError, onPlaybackEnded }));
+
+    rejectNextPlay = true;
+    act(() => result.current.queueAudio('QUESTION_AUDIO'));
+    await waitFor(() => expect(result.current.isBlocked).toBe(true));
+    expect(onError).toHaveBeenCalled();
+    const blockedAudio = audioInstances[0];
+    act(() => result.current.resumeAudio());
+    await waitFor(() => expect(result.current.isPlaying).toBe(true));
+    expect(result.current.isBlocked).toBe(false);
+    expect(audioInstances[0]).toBe(blockedAudio);
+    expect(onPlaybackEnded).not.toHaveBeenCalled();
   });
 });

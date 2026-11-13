@@ -7,6 +7,10 @@ describe('useInterviewWebSocket hook (AC-008 to AC-014, AC-022, AC-026)', () => 
   let mockWsInstances: MockWebSocket[] = [];
 
   class MockWebSocket {
+    static CONNECTING = 0;
+    static OPEN = 1;
+    static CLOSING = 2;
+    static CLOSED = 3;
     url: string;
     readyState: number = WebSocket.CONNECTING;
     onopen: ((event: any) => void) | null = null;
@@ -291,5 +295,55 @@ describe('useInterviewWebSocket hook (AC-008 to AC-014, AC-022, AC-026)', () => 
 
     // A second socket should have been instantiated for reconnection
     expect(mockWsInstances.length).toBe(2);
+  });
+
+  it('ignores delayed messages from an obsolete socket after reconnect', () => {
+    const onAudio = vi.fn();
+    const { result } = renderHook(() => useInterviewWebSocket({
+      token: 'test-token',
+      candidateName: 'Jane',
+      candidateEmail: 'jane@example.com',
+      onAudio,
+    }));
+    const oldSocket = mockWsInstances[0];
+    act(() => oldSocket.triggerOpen());
+    act(() => result.current.reconnect());
+    const newSocket = mockWsInstances[1];
+    act(() => newSocket.triggerOpen());
+    act(() => {
+      oldSocket.triggerMessage({ type: 'audio', turn_index: 1, data: 'STALE', format: 'audio/mp3', is_final_chunk: true });
+      newSocket.triggerMessage({ type: 'audio', turn_index: 1, data: 'CURRENT', format: 'audio/mp3', is_final_chunk: true });
+      oldSocket.triggerError(new Event('error'));
+      oldSocket.triggerClose(1006, 'Delayed old close');
+      oldSocket.triggerOpen();
+    });
+    expect(onAudio).toHaveBeenCalledTimes(1);
+    expect(onAudio).toHaveBeenCalledWith(expect.objectContaining({ data: 'CURRENT' }));
+    expect(result.current.isConnected).toBe(true);
+    expect(result.current.connectionError).toBeNull();
+    act(() => vi.advanceTimersByTime(1100));
+    expect(mockWsInstances).toHaveLength(2);
+  });
+
+  it('logs WebSocket metadata without candidate text, token URL, or audio bytes', () => {
+    vi.stubEnv('VITE_LOG_LEVEL', 'debug');
+    const info = vi.spyOn(console, 'info').mockImplementation(() => {});
+    const debug = vi.spyOn(console, 'debug').mockImplementation(() => {});
+    const { result } = renderHook(() => useInterviewWebSocket({
+      token: 'private-invitation-token', candidateName: 'Private Name', candidateEmail: 'private@example.test',
+    }));
+    const ws = mockWsInstances[0];
+    act(() => ws.triggerOpen());
+    act(() => {
+      ws.triggerMessage({ type: 'question', turn_index: 1, topic: 'Secret topic', text: 'Secret question?', is_follow_up: false, connection_id: '82e77054-e920-4deb-bfe5-1dbb7244cbac' });
+      ws.triggerMessage({ type: 'audio', turn_index: 1, data: 'PRIVATE_AUDIO_BASE64', format: 'audio/mp3', is_final_chunk: true, connection_id: '82e77054-e920-4deb-bfe5-1dbb7244cbac' });
+      result.current.sendTranscriptUpdate('Secret candidate response', true);
+    });
+    const output = [...info.mock.calls, ...debug.mock.calls].map((call) => String(call[0])).join('\n');
+    expect(output).toContain('"connection_id":"82e77054-e920-4deb-bfe5-1dbb7244cbac"');
+    for (const secret of ['private-invitation-token', 'Private Name', 'private@example.test', 'Secret topic', 'Secret question?', 'PRIVATE_AUDIO_BASE64', 'Secret candidate response']) {
+      expect(output).not.toContain(secret);
+    }
+    vi.unstubAllEnvs();
   });
 });

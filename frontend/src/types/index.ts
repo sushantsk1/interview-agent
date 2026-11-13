@@ -103,7 +103,7 @@ export interface SilenceInfo {
 }
 
 // WebSocket message protocols matching CONTRACT.md
-export type WSIncomingMessage =
+export type WSIncomingMessage = (
   | {
       type: 'status';
       state: AgentState;
@@ -145,10 +145,12 @@ export type WSIncomingMessage =
       type: 'error';
       code: string;
       message: string;
+      turn_index?: number;
     }
   | {
       type: 'pong';
-    };
+    }
+) & { connection_id?: string };
 
 export type WSOutgoingMessage =
   | {
@@ -179,4 +181,7 @@ export type WSOutgoingMessage =
     }
   | {
       type: 'ping';
+    }
+  | {
+      type: 'replay_question';
     };

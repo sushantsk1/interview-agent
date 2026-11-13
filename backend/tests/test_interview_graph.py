@@ -1,5 +1,9 @@
 import os
 import pytest
+import langchain_openai
+from backend.app.config import settings
+from backend.app.interview import nodes
+from backend.app.interview.llm_factory import get_llm
 from backend.app.interview import (
     create_interview_graph,
     initialize_interview,
@@ -40,6 +44,203 @@ Experience:
 - Software Engineer at Beta Tech (3 years): Built event-driven pipelines using Celery and Redis. Participated in on-call rotation and production debugging.
 Education: B.S. in Computer Science.
 """
+
+
+def test_configured_nvidia_request_uses_light_model_without_thinking(monkeypatch):
+    captured = {}
+    monkeypatch.setenv("INTERVIEW_MOCK_LLM", "false")
+    monkeypatch.setattr(settings, "NVIDIA_API_KEY", "test-key")
+    monkeypatch.setattr(settings, "NVIDIA_MODEL", "nvidia/nemotron-3.5-bolt-e4b")
+    monkeypatch.setattr(langchain_openai, "ChatOpenAI", lambda **kwargs: captured.update(kwargs) or object())
+
+    get_llm(temperature=0.4, max_tokens=160)
+
+    assert captured["model"] == "nvidia/nemotron-3.5-bolt-e4b"
+    assert captured["max_tokens"] == 160
+    assert captured["max_retries"] == 0
+    assert captured["extra_body"] == {"chat_template_kwargs": {"enable_thinking": False}}
+
+
+def test_first_question_is_grounded_and_requires_no_model_call(monkeypatch):
+    def unexpected_model_call(*_args, **_kwargs):
+        raise AssertionError("Opening turn must not wait for a model request")
+
+    monkeypatch.setattr(nodes, "get_llm", unexpected_model_call)
+    state = initialize_interview(
+        session_id="quick-opening",
+        job_title="Senior Python Backend Engineer",
+        jd_text=SAMPLE_JD,
+        resume_text=SAMPLE_RESUME,
+        graph=create_interview_graph(),
+    )
+    assert "FastAPI" in state["current_question"]
+    assert state["current_turn_index"] == 1
+
+
+def test_non_engineering_jd_and_resume_topics_remain_grounded(monkeypatch):
+    jd = """Cybersecurity Analyst needed.
+- Build threat intelligence and SIEM detection rules.
+- Lead incident response and forensic investigations.
+"""
+    resume = """Maya Chen
+- Investigated phishing campaigns and improved SOC triage.
+"""
+    state = {"job_title": "Cybersecurity Analyst", "jd_text": jd, "resume_text": resume, "config": {"question_count": 6}}
+    topics = topic_generation_node(state)["topics"]
+    assert 3 <= len(topics) <= 5
+    assert "Cybersecurity Analyst" in topics[0]["name"]
+    assert "threat intelligence" in topics[1]["description"]
+    assert "phishing" in topics[2]["description"]
+    assert any(topic["type"] == "behavioral" for topic in topics)
+
+    class TopicModel:
+        def invoke(self, _prompt):
+            return type("Response", (), {"content": '[{"name":"Threat Modeling","description":"Threat intelligence and SIEM","type":"technical"},{"name":"Incident Response","description":"Forensics and response","type":"experience"},{"name":"Security Collaboration","description":"Cross-team work","type":"behavioral"}]'})()
+
+    monkeypatch.setenv("INTERVIEW_MOCK_LLM", "false")
+    monkeypatch.setattr(settings, "NVIDIA_API_KEY", "test-key")
+    monkeypatch.setattr(nodes, "get_llm", lambda **_kwargs: TopicModel())
+    refined = nodes.refine_topics_with_llm({**state, "topics": topics})
+    assert refined is not None
+    assert any(topic["name"] == "Threat Modeling" for topic in refined)
+    assert any(topic["name"] == "Incident Response" for topic in refined)
+
+    # If refinement finishes after the second question, already asked topics
+    # keep their indexes while later topics gain the domain-specific plan.
+    merged = nodes.merge_refined_topics(topics, refined, current_index=1)
+    assert [topic["name"] for topic in merged[:2]] == [topic["name"] for topic in topics[:2]]
+    assert any(topic["name"] == "Threat Modeling" for topic in merged[2:])
+    assert any(topic["type"] == "behavioral" for topic in merged)
+
+
+def test_no_knowledge_answer_advances_and_scores_without_model(monkeypatch):
+    monkeypatch.setenv("INTERVIEW_MOCK_LLM", "false")
+    monkeypatch.setattr(nodes, "get_llm", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("Unexpected model call")))
+    graph = create_interview_graph()
+    state = initialize_interview(
+        session_id="fast-idk",
+        job_title="Senior Python Backend Engineer",
+        jd_text=SAMPLE_JD,
+        graph=graph,
+    )
+    next_state = step_interview(graph, state, candidate_answer="I do not know this technology yet.")
+    assert next_state["current_turn_index"] == 2
+    assert next_state["current_topic_index"] == 1
+    assert next_state["current_question"] != state["current_question"]
+    assert "backend APIs" in next_state["current_question"]
+    assert "Role Requirements" not in next_state["current_question"]
+    assert next_state["last_evaluation"]["scores"]["depth"] <= 2
+
+
+def test_effective_difficulty_uses_explicit_resume_experience_and_ceiling():
+    assert nodes.effective_difficulty("", "Senior") == "Junior"
+    assert nodes.effective_difficulty("Python developer, 1 year of experience", "Senior") == "Junior"
+    assert nodes.effective_difficulty("Software Engineer (4 years)", "Senior") == "Mid-level"
+    assert nodes.effective_difficulty("Senior Software Engineer", "Senior") == "Senior"
+    assert nodes.effective_difficulty("Software Engineer (7 years)", "Junior") == "Junior"
+    assert nodes.effective_difficulty("Built 12 projects from 2019 to 2025", "Senior") == "Junior"
+    assert nodes.effective_difficulty(
+        "Retail Manager with 7 years of experience\nSkills: React",
+        "Senior", "Python Engineer", "Build APIs with Python",
+    ) == "Junior"
+    assert nodes.effective_difficulty(
+        "Retail Manager with 7 years of experience",
+        "Senior", "Engineer", "Build reliable applications",
+    ) == "Junior"
+
+
+def test_initial_question_is_simple_with_missing_resume():
+    state = initialize_interview(
+        session_id="simple-opening",
+        job_title="Senior Python Engineer",
+        jd_text="Build services using Python and FastAPI.",
+        resume_text=None,
+        config={"question_count": 6, "difficulty": "Senior", "duration_minutes": 30},
+        graph=create_interview_graph(),
+    )
+    assert state["current_question"] == "What have you learned about Python?"
+
+
+def test_complex_model_question_falls_back_to_one_practical_concept(monkeypatch):
+    prompts = []
+
+    class ComplexModel:
+        def invoke(self, prompt):
+            prompts.append(prompt)
+            return type("Response", (), {"content": "Design a globally distributed architecture for Python, including failure recovery, consistency trade-offs, database sharding, and edge cases. How would you test it?"})()
+
+    monkeypatch.setattr(nodes, "get_llm", lambda **_kwargs: ComplexModel())
+    state = {
+        "job_title": "Python Engineer", "jd_text": "Use Python and FastAPI.",
+        "resume_text": "Developer with 1 year of experience using Python.",
+        "topics": [{"id": 1, "name": "Python, FastAPI", "description": "Use Python and FastAPI", "type": "technical"}],
+        "current_topic_index": 0, "current_turn_index": 1,
+        "config": {"difficulty": "Senior"}, "messages": [],
+    }
+    result = nodes.ask_question_node(state)
+    assert result["current_question"] == "What have you used Python for?"
+    assert "Candidate experience level (conservative, capped by recruiter setting): Junior" in prompts[0]
+
+
+def test_followup_stays_practical_and_uses_resume_level(monkeypatch):
+    prompts = []
+
+    class ComplexFollowupModel:
+        def invoke(self, prompt):
+            prompts.append(prompt)
+            return type("Response", (), {"content": '{"needs_follow_up":true,"reason":"more detail","follow_up_question":"Explain the complete distributed architecture, cache invalidation, failover strategy, and consistency trade-offs. How would you handle a regional outage?"}'})()
+
+    monkeypatch.setattr(nodes, "get_llm", lambda **_kwargs: ComplexFollowupModel())
+    state = {
+        "job_title": "Python Engineer", "jd_text": "Use Python and FastAPI.",
+        "resume_text": "Developer with 1 year of experience using Python.",
+        "topics": [{"id": 1, "name": "Python", "description": "Python use", "type": "technical"}],
+        "current_topic_index": 0, "current_turn_index": 1, "follow_up_count": 0,
+        "current_question": "What have you used Python for?",
+        "last_candidate_answer": "I used Python to build a simple internal report for my team.",
+        "config": {"difficulty": "Senior", "question_count": 6, "duration_minutes": 30},
+        "evaluations": [], "time_elapsed_seconds": 10,
+    }
+    result = nodes.decide_next_node(state)
+    assert result["next_action"] == "follow_up"
+    assert result["current_question"] == "What was one step you took to check your work?"
+    assert "Candidate experience level: Junior" in prompts[0]
+    assert "Developer with 1 year" in prompts[0]
+
+
+def test_mock_questions_are_concise_and_practical():
+    model = MockChatModel()
+    question = model.generate_deterministic_response(
+        'Generate one clear, engaging, open-ended question. Current Topic: System Design & Data Architecture (technical)'
+    )
+    followup = nodes.parse_json_from_llm(model.generate_deterministic_response(
+        'Decide whether an adaptive follow-up question is warranted. Candidate Answer: "I used Python for reports."'
+    ))
+    assert len(question.split()) <= 20
+    assert "high-throughput" not in question
+    assert len(followup["follow_up_question"].split()) <= 20
+
+
+def test_refined_topic_fallbacks_use_topic_type_and_whole_skill_names():
+    assert "worked with someone" in nodes.quick_question_for_topic(
+        {"id": 1, "name": "Team Collaboration", "description": "Team work", "type": "behavioral"}, "Engineer"
+    )
+    assert "project involving Incident Response" in nodes.quick_question_for_topic(
+        {"id": 2, "name": "Incident Response", "description": "Practical incidents", "type": "experience"}, "Analyst", "Analyst with 4 years of Incident Response experience"
+    )
+    assert "Python" in nodes.quick_question_for_topic(
+        {"id": 3, "name": "Go, Python", "description": "Development", "type": "technical"}, "Developer", "Ongoing Python work"
+    )
+
+
+def test_mismatched_resume_does_not_presuppose_jd_skill_use():
+    react_resume = "Frontend developer who built React interfaces."
+    named_skill = {"id": 1, "name": "Python, FastAPI", "description": "Python APIs", "type": "technical"}
+    requirement = {"id": 2, "name": "Role Requirements & Problem Solving", "description": "Experience with Python", "type": "technical"}
+    experience = {"id": 3, "name": "Incident Response", "description": "Incident Response", "type": "experience"}
+    assert nodes.quick_question_for_topic(named_skill, "Python Engineer", react_resume) == "What have you learned about Python?"
+    assert nodes.quick_question_for_topic(requirement, "Python Engineer", react_resume) == "What do you know about Python?"
+    assert nodes.quick_question_for_topic(experience, "Analyst", react_resume) == "What do you know about Incident Response?"
 
 
 def test_topic_generation_from_jd_and_resume():

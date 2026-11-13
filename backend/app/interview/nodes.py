@@ -1,10 +1,14 @@
 import json
 import logging
+import os
 import re
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from backend.app.interview.llm_factory import get_llm, safe_llm_invoke
+from backend.app.config import settings
+from backend.app.observability import log_event
 from backend.app.interview.prompts import (
     CLOSING_PROMPT,
     EVALUATION_PROMPT,
@@ -50,9 +54,99 @@ def clamp(val: float, low: float = 0.0, high: float = 10.0) -> float:
     return max(low, min(high, round(float(val), 1)))
 
 
+def is_no_knowledge_answer(answer: str) -> bool:
+    lower = answer.lower()
+    markers = (
+        "don't know", "do not know", "no experience", "haven't used",
+        "have not used", "not sure", "no idea",
+    )
+    return any(marker in lower for marker in markers) or bool(re.search(r"\bpass\b", lower))
+
+
+def effective_difficulty(resume_text: str, configured: str, job_title: str = "", jd_text: str = "") -> str:
+    """Use explicit resume experience as evidence, capped by recruiter difficulty."""
+    ceiling = {"Junior": 0, "Mid-level": 1, "Senior": 2, "Lead": 2}.get(configured, 0)
+    title_terms = {
+        term.lower() for term in re.findall(r"[A-Za-z]{4,}", job_title)
+        if term.lower() not in {"junior", "senior", "staff", "lead", "principal", "engineer", "developer", "analyst", "scientist", "manager", "role"}
+    }
+    skill_terms = {
+        skill.lower() for skill in ("Python", "FastAPI", "Java", "JavaScript", "TypeScript", "React", "PostgreSQL", "Redis", "Kafka", "Kubernetes", "Docker", "AWS", "Azure", "Django", "Go", "Rust")
+        if re.search(r"(?<!\w)" + re.escape(skill) + r"(?!\w)", jd_text, re.IGNORECASE)
+    }
+    relevant_terms = title_terms | skill_terms
+
+    def relevant(line: str) -> bool:
+        if not relevant_terms:
+            return not job_title.strip() and not jd_text.strip()
+        return any(re.search(r"(?<!\w)" + re.escape(term) + r"(?!\w)", line, re.IGNORECASE) for term in relevant_terms)
+
+    years = []
+    for line in resume_text.splitlines():
+        if not relevant(line):
+            continue
+        if not re.search(r"\b(?:experience|worked|working|engineer|developer|analyst|scientist|designer|manager|architect)\b", line, re.IGNORECASE):
+            continue
+        for match in re.finditer(r"\b(\d{1,2})\+?\s*(?:years?|yrs?)\b", line, re.IGNORECASE):
+            if re.search(r"\b(?:projects?|project duration|ago)\b", line[max(0, match.start()-24):match.end()+24], re.IGNORECASE):
+                continue
+            years.append(int(match.group(1)))
+    if years:
+        observed = 2 if max(years) >= 6 else 1 if max(years) >= 3 else 0
+    elif any(re.search(r"\b(?:senior|staff|principal|lead)\s+(?:\w+\s+){0,3}(?:engineer|developer|analyst|scientist|designer|manager)\b", line, re.IGNORECASE) and relevant(line) for line in resume_text.splitlines()):
+        observed = 2
+    else:
+        observed = 0
+    return ("Junior", "Mid-level", "Senior")[min(ceiling, observed)]
+
+
+def quick_question_for_topic(topic: Topic, job_title: str, resume_text: str = "") -> str:
+    """Form a short, speakable question from the actual topic context."""
+    name = topic.get("name", job_title)
+    if name == "Role Requirements & Problem Solving":
+        requirement = topic.get("description", "").strip().rstrip(".?!")
+        requirement = re.sub(r"^\d+\+?\s+years?\s+(?:of\s+)?", "", requirement, flags=re.IGNORECASE)
+        requirement = re.sub(r"^(?:deep|strong|proven|hands-on)\s+", "", requirement, flags=re.IGNORECASE)
+        requirement = re.sub(r"^(?:experience|expertise|knowledge|familiarity)\s+(?:with|in|of)\s+", "", requirement, flags=re.IGNORECASE)
+        requirement = re.sub(r"^experience\s+", "", requirement, flags=re.IGNORECASE)
+        requirement = re.sub(r"^(?:build|building|design|designing|lead|leading|develop|developing|create|creating|manage|managing|implement|implementing)\s+", "", requirement, flags=re.IGNORECASE)
+        focus = re.split(r",|\band\b|\bincluding\b|\busing\b", requirement, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+        focus = " ".join(focus.split()[:6]).strip()
+        if focus:
+            matched = bool(re.search(r"(?<!\w)" + re.escape(focus) + r"(?!\w)", resume_text, re.IGNORECASE))
+            return f"What have you done with {focus}?" if matched else f"What do you know about {focus}?"
+        return f"What interests you about the {job_title} role?"
+    if topic.get("type") == "behavioral":
+        return "Tell me about a time you worked with someone to solve a problem."
+    if name == "Candidate Experience":
+        return "What did you do in one project from your resume?" if resume_text.strip() else "What relevant project would you like to discuss?"
+    if topic.get("type") == "experience":
+        focus = " ".join(name.split()[:6])
+        matched = bool(re.search(r"(?<!\w)" + re.escape(focus) + r"(?!\w)", resume_text, re.IGNORECASE))
+        return f"What did you do in a project involving {focus}?" if matched else f"What do you know about {focus}?"
+    if name.startswith("Core Skills for "):
+        return f"Which part of your experience fits the {job_title} role?" if resume_text.strip() else f"What interests you about the {job_title} role?"
+    matched_skill = next((skill.strip() for skill in name.split(",") if re.search(r"(?<!\w)" + re.escape(skill.strip()) + r"(?!\w)", resume_text, re.IGNORECASE)), None)
+    focus = matched_skill or name.split(",")[0].strip()
+    focus = " ".join(focus.split()[:6])
+    return f"What have you used {focus} for?" if matched_skill else f"What have you learned about {focus}?"
+
+
+def concise_question(raw: str, fallback: str) -> str:
+    """Reject long or multi-part model challenges instead of cutting speech mid-sentence."""
+    question = raw.strip().strip('"“”').removeprefix("Question:").strip()
+    words = re.findall(r"\b[\w'-]+\b", question)
+    if not question or len(words) > 20 or "\n" in question or question.count("?") > 1 or ";" in question:
+        return fallback
+    if re.search(r"[.!?]\s+\S|\b(?:including|as well as|in addition|also explain|then explain|and how|and why|and what)\b", question, re.IGNORECASE):
+        return fallback
+    return question
+
+
 def topic_generation_node(state: InterviewState) -> Dict[str, Any]:
     """
-    Extracts 3-5 competency topics from JD and Resume (AC-015).
+    Extracts competency topics without an extra model round trip on room entry.
+    The question model still receives the job description and resume for grounding.
     """
     existing_topics = state.get("topics")
     if existing_topics and len(existing_topics) >= 2:
@@ -60,63 +154,109 @@ def topic_generation_node(state: InterviewState) -> Dict[str, Any]:
 
     job_title = state.get("job_title", "Software Engineer")
     jd_text = state.get("jd_text", "")
-    resume_text = state.get("resume_text") or "No resume provided."
-    question_count = state.get("config", {}).get("question_count", 8)
-    topic_count = max(3, min(5, question_count // 2 if question_count >= 6 else 3))
-
-    prompt = TOPIC_GENERATION_PROMPT.format(
-        job_title=job_title,
-        jd_text=jd_text,
-        resume_text=resume_text,
-        topic_count=topic_count,
+    resume_text = state.get("resume_text") or ""
+    skills = [
+        "Python", "FastAPI", "Java", "JavaScript", "TypeScript", "React", "Node.js",
+        "PostgreSQL", "MySQL", "MongoDB", "Redis", "Kafka", "Kubernetes",
+        "Docker", "AWS", "Azure", "GCP", "GraphQL", "Django", "Go", "Rust",
+    ]
+    required = [skill for skill in skills if re.search(r"(?<!\w)" + re.escape(skill) + r"(?!\w)", jd_text, re.IGNORECASE)]
+    experience = [skill for skill in skills if re.search(r"(?<!\w)" + re.escape(skill) + r"(?!\w)", resume_text, re.IGNORECASE)]
+    priority = required[:3]
+    if not priority:
+        priority = experience[:2]
+    primary_name = ", ".join(priority) if priority else f"Core Skills for {job_title}"
+    primary_description = (
+        f"Discuss practical experience with {', '.join(priority)} in the {job_title} role."
+        if priority else f"Discuss the primary technical requirements for the {job_title} role."
     )
-
-    llm = get_llm(temperature=0.2)
-    response_text = safe_llm_invoke(llm, prompt)
-    raw_topics = parse_json_from_llm(response_text, [])
-
-    topics: List[Topic] = []
-    if isinstance(raw_topics, list) and len(raw_topics) >= 2:
-        for i, t in enumerate(raw_topics):
-            if isinstance(t, dict):
-                topics.append(
-                    Topic(
-                        id=t.get("id", i + 1),
-                        name=t.get("name", f"Competency {i+1}"),
-                        description=t.get("description", "Evaluation of core skills"),
-                        type=t.get("type", "technical" if i < 2 else "behavioral"),
-                    )
-                )
-
-    if not topics or len(topics) < 2:
-        topics = [
-            Topic(
-                id=1,
-                name="Core Technical Skills",
-                description=f"Core technical competencies and framework proficiency required for {job_title}.",
-                type="technical",
-            ),
-            Topic(
-                id=2,
-                name="System Architecture & Data Design",
-                description="Distributed architecture, scalability, persistence, and reliability.",
-                type="technical",
-            ),
-            Topic(
-                id=3,
-                name="Production Experience & Troubleshooting",
-                description="Handling outages, observability, debugging, and continuous delivery.",
-                type="experience",
-            ),
-            Topic(
-                id=4,
-                name="Behavioral & Engineering Leadership",
-                description="Collaboration, architectural trade-offs, code reviews, and mentorship.",
-                type="behavioral",
-            ),
-        ]
+    jd_requirements = [
+        re.sub(r"^\s*[-*\u2022\d.)]+\s*", "", line).strip()
+        for line in jd_text.splitlines()
+        if line.strip().startswith(("-", "*", "\u2022"))
+    ]
+    jd_requirements = [line for line in jd_requirements if len(line) >= 12]
+    role_requirement = jd_requirements[0] if jd_requirements else jd_text.strip()[:180]
+    resume_lines = [line.strip(" -\u2022\t") for line in resume_text.splitlines() if len(line.strip()) >= 18]
+    relevant_experience = resume_lines[0] if resume_lines else "Relevant production work, debugging, testing, and delivery experience."
+    topics: List[Topic] = [
+        Topic(id=1, name=primary_name, description=primary_description, type="technical"),
+        Topic(id=2, name="Role Requirements & Problem Solving", description=role_requirement or f"Core requirements for {job_title}.", type="technical"),
+        Topic(id=3, name="Candidate Experience", description=relevant_experience, type="experience"),
+        Topic(id=4, name="Behavioral & Collaboration", description="Collaboration, trade-offs, communication, and leadership.", type="behavioral"),
+    ]
 
     return {"topics": topics, "current_topic_index": 0}
+
+
+def refine_topics_with_llm(state: InterviewState) -> Optional[List[Topic]]:
+    """Refine later topics while the candidate hears and answers the first question."""
+    if os.getenv("INTERVIEW_MOCK_LLM", "").lower() in ("1", "true", "yes") or not settings.NVIDIA_API_KEY:
+        return None
+    existing = list(state.get("topics", []))
+    if not existing:
+        return None
+    prompt = TOPIC_GENERATION_PROMPT.format(
+        job_title=state.get("job_title", "Software Engineer"),
+        jd_text=state.get("jd_text", "")[:3000],
+        resume_text=(state.get("resume_text") or "No resume provided.")[:1500],
+        topic_count=4,
+    )
+    try:
+        started = time.perf_counter()
+        log_event(logger, logging.INFO, "model_started", stage="topic_refinement", model=settings.NVIDIA_MODEL)
+        response = get_llm(temperature=0.2, max_tokens=450).invoke(prompt)
+        log_event(logger, logging.INFO, "model_completed", stage="topic_refinement", duration_ms=round((time.perf_counter() - started) * 1000, 1))
+        raw = parse_json_from_llm(str(response.content), [])
+    except Exception as exc:
+        log_event(logger, logging.WARNING, "model_fallback", stage="topic_refinement", error_type=type(exc).__name__)
+        return None
+    if not isinstance(raw, list):
+        return None
+    topics = [existing[0]]
+    seen = {existing[0]["name"].casefold()}
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name", "")).strip()[:100]
+        if len(name) < 4 or name.casefold() in seen:
+            continue
+        seen.add(name.casefold())
+        topic_type = item.get("type", "technical")
+        if topic_type not in ("technical", "experience", "behavioral"):
+            topic_type = "technical"
+        topics.append(Topic(
+            id=len(topics) + 1,
+            name=name,
+            description=str(item.get("description", ""))[:240] or name,
+            type=topic_type,
+        ))
+        if len(topics) == 4:
+            break
+    if len(topics) < 3:
+        return None
+    if not any(topic["type"] == "behavioral" for topic in topics):
+        topics.append(existing[-1])
+    return topics[:5]
+
+
+def merge_refined_topics(current: List[Topic], refined: List[Topic], current_index: int) -> List[Topic]:
+    """Keep topics already asked in place while improving the remaining plan."""
+    preserved = list(current[:max(0, current_index + 1)])
+    names = {topic["name"].casefold() for topic in preserved}
+    merged = list(preserved)
+    for topic in refined:
+        if topic["name"].casefold() not in names and len(merged) < 5:
+            merged.append(topic)
+            names.add(topic["name"].casefold())
+    if not any(topic["type"] == "behavioral" for topic in merged):
+        behavioral = next((topic for topic in refined if topic["type"] == "behavioral"), None)
+        if behavioral and len(preserved) < 5:
+            if len(merged) == 5:
+                merged[-1] = behavioral
+            else:
+                merged.append(behavioral)
+    return [Topic(id=i + 1, name=topic["name"], description=topic["description"], type=topic["type"]) for i, topic in enumerate(merged)]
 
 
 def greeting_node(state: InterviewState) -> Dict[str, Any]:
@@ -127,10 +267,7 @@ def greeting_node(state: InterviewState) -> Dict[str, Any]:
     job_title = state.get("job_title", "Technical Position")
     candidate_name = state.get("candidate_name") or "Candidate"
 
-    greeting_text = (
-        f"Hello {candidate_name}! Welcome to your technical interview for the {job_title} role. "
-        "We'll cover your technical expertise, system design, and practical experience. Let's begin."
-    )
+    greeting_text = f"Hi {candidate_name}."
 
     messages = list(state.get("messages", []))
     msg: Message = {
@@ -159,10 +296,50 @@ def ask_question_node(state: InterviewState) -> Dict[str, Any]:
 
     current_topic = topics[topic_idx]
     job_title = state.get("job_title", "Software Engineer")
+    difficulty = effective_difficulty(state.get("resume_text") or "", state.get("config", {}).get("difficulty", "Mid-level"), job_title, state.get("jd_text", ""))
+    if state.get("current_turn_index", 0) == 0:
+        # The opening turn is ready immediately from JD-ranked competencies.
+        # Later turns use the lightweight NVIDIA model for adaptation.
+        question_text = quick_question_for_topic(current_topic, job_title, state.get("resume_text") or "")
+        log_event(logger, logging.INFO, "question_generated", question_source="opening_template", difficulty=difficulty)
+        messages = list(state.get("messages", []))
+        messages.append(Message(
+            role="interviewer",
+            content=question_text,
+            type="question",
+            timestamp=datetime.now(timezone.utc).isoformat(),
+        ))
+        return {
+            "current_question": question_text,
+            "current_turn_index": 1,
+            "follow_up_count": 0,
+            "is_follow_up": False,
+            "needs_steering": False,
+            "steering_message": None,
+            "phase": "questioning",
+            "messages": messages,
+        }
+    if is_no_knowledge_answer(state.get("last_candidate_answer", "")):
+        question_text = quick_question_for_topic(current_topic, job_title, state.get("resume_text") or "")
+        log_event(logger, logging.INFO, "question_generated", question_source="no_knowledge_template", difficulty=difficulty)
+        messages = list(state.get("messages", []))
+        messages.append(Message(
+            role="interviewer", content=question_text, type="question",
+            timestamp=datetime.now(timezone.utc).isoformat(),
+        ))
+        return {
+            "current_question": question_text,
+            "current_turn_index": state.get("current_turn_index", 0) + 1,
+            "follow_up_count": 0,
+            "is_follow_up": False,
+            "needs_steering": False,
+            "steering_message": None,
+            "phase": "questioning",
+            "messages": messages,
+        }
     config = state.get("config", {})
-    difficulty = config.get("difficulty", "Mid-level")
-    jd_text = state.get("jd_text", "")
-    resume_text = state.get("resume_text") or "None"
+    jd_text = state.get("jd_text", "")[:2500]
+    resume_text = (state.get("resume_text") or "None")[:1200]
 
     # Previous questions to prevent duplication
     prev_qs = [
@@ -183,8 +360,12 @@ def ask_question_node(state: InterviewState) -> Dict[str, Any]:
         previous_questions=previous_questions_str,
     )
 
-    llm = get_llm(temperature=0.5)
-    question_text = safe_llm_invoke(llm, prompt).strip()
+    llm = get_llm(temperature=0.4, max_tokens=160)
+    raw_question = safe_llm_invoke(llm, prompt, stage="question")
+    fallback_question = quick_question_for_topic(current_topic, job_title, state.get("resume_text") or "")
+    question_text = concise_question(raw_question, fallback_question)
+    source = "simplified_fallback" if question_text == fallback_question and raw_question.strip() != fallback_question else "model"
+    log_event(logger, logging.INFO, "question_generated", question_source=source, difficulty=difficulty)
 
     messages = list(state.get("messages", []))
     msg: Message = {
@@ -243,7 +424,7 @@ def steering_node(state: InterviewState) -> Dict[str, Any]:
     )
 
     llm = get_llm(temperature=0.1)
-    response_text = safe_llm_invoke(llm, prompt)
+    response_text = safe_llm_invoke(llm, prompt, stage="steering")
     parsed = parse_json_from_llm(response_text, {})
 
     is_drift = bool(parsed.get("is_drift", False))
@@ -288,17 +469,28 @@ def evaluate_answer_node(state: InterviewState) -> Dict[str, Any]:
     job_title = state.get("job_title", "Software Engineer")
     jd_text = state.get("jd_text", "")
 
+    difficulty = effective_difficulty(state.get("resume_text") or "", state.get("config", {}).get("difficulty", "Mid-level"), job_title, jd_text)
     prompt = EVALUATION_PROMPT.format(
         job_title=job_title,
+        difficulty=difficulty,
         topic_name=topic_name,
         question=question,
         candidate_answer=candidate_answer,
         jd_text=jd_text,
     )
 
-    llm = get_llm(temperature=0.2)
-    response_text = safe_llm_invoke(llm, prompt)
-    parsed = parse_json_from_llm(response_text, {})
+    if is_no_knowledge_answer(candidate_answer):
+        parsed = {
+            "relevance": 4.0,
+            "depth": 1.0,
+            "correctness": 1.0,
+            "communication": 6.0,
+            "feedback": "Candidate stated they did not have direct experience with this concept.",
+        }
+    else:
+        llm = get_llm(temperature=0.2, max_tokens=220)
+        response_text = safe_llm_invoke(llm, prompt, stage="evaluation")
+        parsed = parse_json_from_llm(response_text, {})
 
     # Defaults
     rel = clamp(parsed.get("relevance", 7.0))
@@ -308,11 +500,7 @@ def evaluate_answer_node(state: InterviewState) -> Dict[str, Any]:
     feedback = str(parsed.get("feedback", "Answer demonstrated basic competency.")).strip()
 
     # Handling short / 'I don't know' answers (AC-018)
-    no_knowledge_markers = [
-        "don't know", "do not know", "no experience", "haven't used",
-        "have not used", "not sure", "no idea", "pass"
-    ]
-    if any(m in candidate_answer.lower() for m in no_knowledge_markers):
+    if is_no_knowledge_answer(candidate_answer):
         rel = min(rel, 5.0)
         dep = min(dep, 2.0)
         cor = min(cor, 2.0)
@@ -366,11 +554,7 @@ def decide_next_node(state: InterviewState) -> Dict[str, Any]:
 
     # 3. Handle 'I don't know' / short answer without stalling (AC-018)
     candidate_answer = state.get("last_candidate_answer", "").lower()
-    no_knowledge_markers = [
-        "don't know", "do not know", "no experience", "haven't used",
-        "have not used", "not sure", "no idea"
-    ]
-    if any(m in candidate_answer for m in no_knowledge_markers):
+    if is_no_knowledge_answer(candidate_answer):
         # Do not probe further; advance to next topic
         topics = state.get("topics", [])
         next_topic_idx = state.get("current_topic_index", 0) + 1
@@ -390,9 +574,9 @@ def decide_next_node(state: InterviewState) -> Dict[str, Any]:
         topic_idx = state.get("current_topic_index", 0)
         topic_name = topics[topic_idx]["name"] if topic_idx < len(topics) else "General"
         job_title = state.get("job_title", "Software Engineer")
-        difficulty = config.get("difficulty", "Mid-level")
         question = state.get("current_question", "")
         jd_text = state.get("jd_text", "")
+        difficulty = effective_difficulty(state.get("resume_text") or "", config.get("difficulty", "Mid-level"), job_title, jd_text)
 
         prompt = FOLLOW_UP_PROMPT.format(
             job_title=job_title,
@@ -401,16 +585,23 @@ def decide_next_node(state: InterviewState) -> Dict[str, Any]:
             question=question,
             candidate_answer=state.get("last_candidate_answer", ""),
             jd_text=jd_text,
+            resume_text=(state.get("resume_text") or "No resume provided.")[:1200],
         )
 
         llm = get_llm(temperature=0.3)
-        response_text = safe_llm_invoke(llm, prompt)
+        response_text = safe_llm_invoke(llm, prompt, stage="followup")
         parsed = parse_json_from_llm(response_text, {})
 
         needs_follow_up = bool(parsed.get("needs_follow_up", False))
-        follow_up_q = parsed.get("follow_up_question", "").strip()
+        raw_follow_up = str(parsed.get("follow_up_question", ""))
+        follow_up_q = concise_question(
+            raw_follow_up,
+            "What was one step you took to check your work?",
+        ) if needs_follow_up else ""
 
         if needs_follow_up and follow_up_q:
+            source = "simplified_fallback" if follow_up_q != raw_follow_up.strip() else "model"
+            log_event(logger, logging.INFO, "question_generated", question_source=source, difficulty=difficulty)
             return {
                 "next_action": "follow_up",
                 "current_question": follow_up_q,
@@ -468,7 +659,7 @@ def closing_node(state: InterviewState) -> Dict[str, Any]:
     )
 
     llm = get_llm(temperature=0.3)
-    closing_text = safe_llm_invoke(llm, prompt).strip()
+    closing_text = safe_llm_invoke(llm, prompt, stage="closing").strip()
 
     messages = list(state.get("messages", []))
     msg: Message = {
@@ -527,7 +718,7 @@ def scorecard_node(state: InterviewState) -> Dict[str, Any]:
     )
 
     llm = get_llm(temperature=0.2)
-    response_text = safe_llm_invoke(llm, prompt)
+    response_text = safe_llm_invoke(llm, prompt, stage="scorecard")
     parsed = parse_json_from_llm(response_text, {})
 
     # Recommendation validation

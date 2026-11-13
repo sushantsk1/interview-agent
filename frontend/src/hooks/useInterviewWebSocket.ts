@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import type { WSIncomingMessage, WSOutgoingMessage } from '../types';
 import { getWebSocketUrl } from '../services/api';
+import { logDiagnostic } from '../services/diagnostics';
 
 export interface UseInterviewWebSocketOptions {
   token: string | undefined;
@@ -71,6 +72,8 @@ export function useInterviewWebSocket({
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const connectRef = useRef<() => void>(() => {});
   const isUnmountedRef = useRef(false);
+  const connectionIdRef = useRef<string | undefined>(undefined);
+  const micChunkStatsRef = useRef({ count: 0, bytes: 0 });
 
   const candidateNameRef = useRef(candidateName);
   const candidateEmailRef = useRef(candidateEmail);
@@ -119,9 +122,34 @@ export function useInterviewWebSocket({
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       try {
         wsRef.current.send(JSON.stringify(payload));
+        if (payload.type === 'audio_chunk') {
+          micChunkStatsRef.current.count += 1;
+          micChunkStatsRef.current.bytes += Math.floor(payload.data.length * 3 / 4);
+          if (micChunkStatsRef.current.count >= 20) {
+            logDiagnostic('debug', 'media_chunk_batch', {
+              connection_id: connectionIdRef.current,
+              chunk_count: micChunkStatsRef.current.count,
+              byte_count: micChunkStatsRef.current.bytes,
+            });
+            micChunkStatsRef.current = { count: 0, bytes: 0 };
+          }
+        } else {
+          if (payload.type === 'done_answering' && micChunkStatsRef.current.count > 0) {
+            logDiagnostic('debug', 'media_chunk_batch', {
+              connection_id: connectionIdRef.current,
+              chunk_count: micChunkStatsRef.current.count,
+              byte_count: micChunkStatsRef.current.bytes,
+            });
+            micChunkStatsRef.current = { count: 0, bytes: 0 };
+          }
+          logDiagnostic(payload.type === 'ping' || payload.type === 'transcript_update' ? 'debug' : 'info', 'ws_send', {
+            connection_id: connectionIdRef.current,
+            message_type: payload.type,
+          });
+        }
         return true;
-      } catch (err) {
-        console.warn('Failed to send WebSocket message:', err);
+      } catch {
+        logDiagnostic('warn', 'ws_error', { connection_id: connectionIdRef.current, error_code: 'SEND_FAILED' });
         return false;
       }
     }
@@ -191,6 +219,9 @@ export function useInterviewWebSocket({
     clearReconnectTimer();
 
     setIsConnecting(true);
+    connectionIdRef.current = undefined;
+    micChunkStatsRef.current = { count: 0, bytes: 0 };
+    logDiagnostic('info', 'ws_connect');
     const wsUrl = getWebSocketUrl(token);
 
     try {
@@ -198,7 +229,8 @@ export function useInterviewWebSocket({
       wsRef.current = ws;
 
       ws.onopen = () => {
-        if (isUnmountedRef.current) return;
+        if (isUnmountedRef.current || wsRef.current !== ws) return;
+        logDiagnostic('info', 'ws_open');
         setIsConnected(true);
         setIsConnecting(false);
         setConnectionError(null);
@@ -221,9 +253,18 @@ export function useInterviewWebSocket({
       };
 
       ws.onmessage = (event: MessageEvent) => {
-        if (isUnmountedRef.current) return;
+        if (isUnmountedRef.current || wsRef.current !== ws) return;
         try {
           const msg = JSON.parse(event.data) as WSIncomingMessage;
+          if (msg.connection_id) connectionIdRef.current = msg.connection_id;
+          logDiagnostic(msg.type === 'silence_tick' || msg.type === 'transcript' || msg.type === 'pong' ? 'debug' : 'info', 'ws_receive', {
+            connection_id: connectionIdRef.current,
+            message_type: msg.type,
+            turn_index: 'turn_index' in msg ? msg.turn_index : ('question_index' in msg ? msg.question_index : undefined),
+            state: msg.type === 'status' ? msg.state : undefined,
+            error_code: msg.type === 'error' ? msg.code : undefined,
+            byte_count: msg.type === 'audio' ? Math.floor(msg.data.length * 3 / 4) : undefined,
+          });
           switch (msg.type) {
             case 'status':
               onStatusRef.current?.(msg);
@@ -244,27 +285,30 @@ export function useInterviewWebSocket({
               onInterviewCompleteRef.current?.(msg);
               break;
             case 'error':
-              setConnectionError(msg.message || 'Server error occurred');
+              if (msg.code !== 'TTS_FAILED') {
+                setConnectionError(msg.message || 'Server error occurred');
+              }
               onErrorRef.current?.(msg);
               break;
             case 'pong':
               onPongRef.current?.();
               break;
           }
-        } catch (err) {
-          console.warn('Failed to parse incoming WebSocket message:', err);
+        } catch {
+          logDiagnostic('warn', 'ws_parse_error', { connection_id: connectionIdRef.current, error_code: 'INVALID_JSON' });
         }
       };
 
       ws.onerror = (evt: Event) => {
-        if (isUnmountedRef.current) return;
-        console.warn('WebSocket connection error:', evt);
+        if (isUnmountedRef.current || wsRef.current !== ws) return;
+        logDiagnostic('warn', 'ws_error', { connection_id: connectionIdRef.current, error_code: 'SOCKET_ERROR' });
         setConnectionError('Connection interrupted. Unable to reach interview server.');
         onErrorRef.current?.(evt);
       };
 
       ws.onclose = (evt: CloseEvent) => {
-        if (isUnmountedRef.current) return;
+        if (isUnmountedRef.current || wsRef.current !== ws) return;
+        logDiagnostic('info', 'ws_close', { connection_id: connectionIdRef.current, close_code: evt.code });
         setIsConnected(false);
         setIsConnecting(false);
         clearHeartbeat();
@@ -275,6 +319,7 @@ export function useInterviewWebSocket({
             const next = prev + 1;
             if (next <= maxReconnectAttempts) {
               const backoffMs = Math.min(1000 * Math.pow(2, next - 1), 8000);
+              logDiagnostic('info', 'ws_reconnect', { connection_id: connectionIdRef.current, attempt: next, elapsed_ms: backoffMs, outcome: 'retry' });
               setConnectionError(`Connection lost. Retrying in ${(backoffMs / 1000).toFixed(0)}s (attempt ${next}/${maxReconnectAttempts})...`);
               reconnectTimerRef.current = setTimeout(() => {
                 connectRef.current();
@@ -286,8 +331,8 @@ export function useInterviewWebSocket({
           });
         }
       };
-    } catch (err) {
-      console.warn('Error opening WebSocket:', err);
+    } catch {
+      logDiagnostic('warn', 'ws_error', { error_code: 'CONNECT_FAILED' });
       setIsConnecting(false);
       setConnectionError('Failed to initiate WebSocket connection.');
     }

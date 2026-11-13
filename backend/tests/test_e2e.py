@@ -220,7 +220,9 @@ def test_complete_interview_lifecycle_e2e(
         })
 
         # Expect AI Spoken Greeting sequence (AC-010)
-        # Message 1: status -> speaking
+        preparing = ws.receive_json()
+        assert preparing["type"] == "status" and preparing["state"] == "thinking"
+        # Next: status -> speaking
         m_status1 = ws.receive_json()
         assert m_status1["type"] == "status"
         assert m_status1["state"] == "speaking"
@@ -570,6 +572,7 @@ def test_duration_cap_and_silence_detection_e2e(e2e_client, e2e_sqlite_db):
     # 2. Connect WebSocket and start
     with e2e_client.websocket_connect(f"/ws/interview/{token}") as ws:
         ws.send_json({"type": "start", "candidate_name": "Taylor Swift"})
+        ws.receive_json()  # status: thinking
         ws.receive_json()  # status: speaking
         ws.receive_json()  # question: 1
         ws.receive_json()  # audio: 1

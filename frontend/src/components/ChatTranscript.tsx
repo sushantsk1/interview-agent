@@ -6,12 +6,14 @@ interface ChatTranscriptProps {
   messages: ChatMessage[];
   interimTranscript?: string;
   isListening?: boolean;
+  isThinking?: boolean;
 }
 
 export const ChatTranscript: React.FC<ChatTranscriptProps> = ({
   messages,
   interimTranscript = '',
   isListening = false,
+  isThinking = false,
 }) => {
   const scrollEndRef = useRef<HTMLDivElement>(null);
 
@@ -19,7 +21,7 @@ export const ChatTranscript: React.FC<ChatTranscriptProps> = ({
     if (scrollEndRef.current && typeof scrollEndRef.current.scrollIntoView === 'function') {
       scrollEndRef.current.scrollIntoView({ behavior: 'smooth' });
     }
-  }, [messages, interimTranscript]);
+  }, [messages, interimTranscript, isThinking]);
 
   const formatTime = (isoString?: string) => {
     if (!isoString) return '';
@@ -119,7 +121,58 @@ export const ChatTranscript: React.FC<ChatTranscriptProps> = ({
       {isListening && !interimTranscript && (
         <div className="flex items-center gap-2 px-3 py-2 rounded-xl bg-slate-900/50 border border-slate-800/70 text-slate-400 text-xs w-fit">
           <span className="w-2 h-2 rounded-full bg-emerald-400 animate-ping" />
-          <span>Microphone active � speak your answer clearly...</span>
+          <span>Microphone active — speak your answer clearly...</span>
+        </div>
+      )}
+
+      {/* Question Generation Loader - Neural Waveform & Thinking Orb (Option A) */}
+      {isThinking && (
+        <div data-testid="thinking-loader" className="flex flex-col items-start max-w-[88%] sm:max-w-[80%] animate-fade-in space-y-1">
+          {/* Header */}
+          <div className="flex items-center gap-2 mb-0.5 text-[11px] text-indigo-400">
+            <div className="w-5 h-5 rounded-full bg-indigo-950 border border-indigo-700 flex items-center justify-center text-indigo-300">
+              <Bot className="w-3 h-3 animate-pulse" />
+            </div>
+            <span className="font-semibold text-slate-300">AI Interviewer</span>
+            <span className="text-[10px] px-2 py-0.5 rounded-full bg-indigo-950/80 border border-indigo-800 text-indigo-300 font-mono flex items-center gap-1">
+              <span className="w-1.5 h-1.5 rounded-full bg-indigo-400 animate-ping" />
+              Thinking...
+            </span>
+          </div>
+
+          {/* Loader Card */}
+          <div className="p-3.5 rounded-2xl rounded-tl-sm bg-slate-900/95 border border-indigo-500/40 text-slate-100 shadow-lg shadow-indigo-950/30 w-full space-y-3">
+            <div className="flex items-center justify-between gap-3">
+              <div className="flex items-center gap-2.5">
+                <div className="relative flex items-center justify-center w-7 h-7 rounded-xl bg-gradient-to-tr from-indigo-600 via-indigo-500 to-violet-500 shadow-md shadow-indigo-500/25 shrink-0">
+                  <span className="w-2.5 h-2.5 rounded-full bg-white animate-ping" />
+                </div>
+                <div>
+                  <div className="text-xs font-semibold text-slate-200">
+                    Formulating next question...
+                  </div>
+                  <div className="text-[10px] text-slate-400">
+                    Evaluating response & synthesizing question
+                  </div>
+                </div>
+              </div>
+
+              {/* Animated Soundwave Equalizer */}
+              <div className="flex items-center gap-1 h-6 px-2 py-1 rounded-lg bg-slate-950 border border-slate-800 shrink-0">
+                <span className="w-1 bg-indigo-400 rounded-full wave-bar" />
+                <span className="w-1 bg-violet-400 rounded-full wave-bar" />
+                <span className="w-1 bg-pink-400 rounded-full wave-bar" />
+                <span className="w-1 bg-indigo-400 rounded-full wave-bar" />
+                <span className="w-1 bg-violet-400 rounded-full wave-bar" />
+              </div>
+            </div>
+
+            {/* Shimmer skeleton lines previewing incoming question */}
+            <div className="space-y-1.5 pt-0.5">
+              <div className="h-2 rounded-full w-4/5 animate-shimmer" />
+              <div className="h-2 rounded-full w-3/5 animate-shimmer" />
+            </div>
+          </div>
         </div>
       )}
 

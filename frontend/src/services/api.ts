@@ -6,8 +6,29 @@ import type {
   ScorecardResponse,
   TranscriptResponse,
 } from '../types';
+import { diagnosticNow, logDiagnostic } from './diagnostics';
+import type { DiagnosticFields } from './diagnostics';
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000/api';
+
+async function fetchWithDiagnostics(operation: NonNullable<DiagnosticFields['operation']>, url: string, init: RequestInit): Promise<Response> {
+  const started = diagnosticNow();
+  logDiagnostic('info', 'http_start', { operation });
+  try {
+    const response = await fetch(url, init);
+    logDiagnostic('info', 'http_complete', {
+      operation,
+      status: response.status,
+      elapsed_ms: diagnosticNow() - started,
+      request_id: response.headers?.get?.('X-Request-ID') || undefined,
+      outcome: response.ok ? 'success' : 'failure',
+    });
+    return response;
+  } catch {
+    logDiagnostic('warn', 'http_error', { operation, elapsed_ms: diagnosticNow() - started, outcome: 'failure' });
+    throw new Error('Network request failed');
+  }
+}
 
 export class ApiError extends Error {
   status: number;
@@ -50,7 +71,7 @@ export async function fetchSessionByToken(token: string): Promise<SessionMetadat
   
   let response: Response;
   try {
-    response = await fetch(url, {
+    response = await fetchWithDiagnostics('session_lookup', url, {
       method: 'GET',
       headers: {
         'Accept': 'application/json',
@@ -84,7 +105,7 @@ export async function fetchSessions(
 
   let response: Response;
   try {
-    response = await fetch(url, {
+    response = await fetchWithDiagnostics('session_list', url, {
       method: 'GET',
       headers: {
         'Accept': 'application/json',
@@ -107,7 +128,7 @@ export async function createSession(payload: CreateSessionPayload): Promise<Sess
 
   let response: Response;
   try {
-    response = await fetch(url, {
+    response = await fetchWithDiagnostics('session_create', url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -137,7 +158,7 @@ export async function uploadResume(
 
   let response: Response;
   try {
-    response = await fetch(url, {
+    response = await fetchWithDiagnostics('resume_upload', url, {
       method: 'POST',
       body: formData,
     });
@@ -158,7 +179,7 @@ export async function fetchScorecard(sessionId: string): Promise<ScorecardRespon
 
   let response: Response;
   try {
-    response = await fetch(url, {
+    response = await fetchWithDiagnostics('scorecard_lookup', url, {
       method: 'GET',
       headers: {
         'Accept': 'application/json',
@@ -181,7 +202,7 @@ export async function fetchTranscript(sessionId: string): Promise<TranscriptResp
 
   let response: Response;
   try {
-    response = await fetch(url, {
+    response = await fetchWithDiagnostics('transcript_lookup', url, {
       method: 'GET',
       headers: {
         'Accept': 'application/json',

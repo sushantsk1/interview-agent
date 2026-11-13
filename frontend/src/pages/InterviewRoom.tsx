@@ -5,11 +5,13 @@ import type {
   SessionMetadata,
   AgentState,
   ChatMessage,
+  WSIncomingMessage,
 } from '../types';
 import { useMediaStream } from '../hooks/useMediaStream';
 import { useAudioRecorder } from '../hooks/useAudioRecorder';
 import { useAudioPlayer } from '../hooks/useAudioPlayer';
 import { useInterviewWebSocket } from '../hooks/useInterviewWebSocket';
+import { diagnosticNow, logDiagnostic } from '../services/diagnostics';
 import { AIAvatar } from '../components/AIAvatar';
 import { CandidateWebcam } from '../components/CandidateWebcam';
 import { ChatTranscript } from '../components/ChatTranscript';
@@ -28,7 +30,10 @@ import {
   Sparkles,
   Award,
   RefreshCw,
+  Volume2,
 } from 'lucide-react';
+
+type QuestionMessage = Extract<WSIncomingMessage, { type: 'question' }>;
 
 export const InterviewRoom: React.FC = () => {
   const { token } = useParams<{ token: string }>();
@@ -54,6 +59,20 @@ export const InterviewRoom: React.FC = () => {
   const [isTextFallbackOpen, setIsTextFallbackOpen] = useState(false);
   const [isCompleted, setIsCompleted] = useState(false);
   const [closingMessage, setClosingMessage] = useState<string>('');
+  const [voiceError, setVoiceError] = useState<string | null>(null);
+  const [hasQuestion, setHasQuestion] = useState(false);
+  const [isPreparingQuestion, setIsPreparingQuestion] = useState(false);
+  const audioPendingRef = React.useRef(false);
+  const completePendingRef = React.useRef(false);
+  const serverStateRef = React.useRef<AgentState>('idle');
+  const currentQuestionRef = React.useRef<{ turnIndex: number; text: string } | null>(null);
+  const pendingQuestionRef = React.useRef<QuestionMessage | null>(null);
+  const publishedQuestionRef = React.useRef<{ turnIndex: number; text: string } | null>(null);
+  const speechFailedRef = React.useRef(false);
+  const readFallbackRef = React.useRef(false);
+  const connectionIdRef = React.useRef<string | undefined>(undefined);
+  const questionPendingAtRef = React.useRef<number | null>(null);
+  const questionAudioRef = React.useRef<{ turnIndex: number; chunks: Array<{ data: string; format: string; connection_id?: string }> } | null>(null);
 
   // Media & Hardware
   const {
@@ -68,17 +87,63 @@ export const InterviewRoom: React.FC = () => {
     stopAllTracks,
   } = useMediaStream(true);
 
+  const publishQuestion = (question: QuestionMessage) => {
+    pendingQuestionRef.current = null;
+    publishedQuestionRef.current = { turnIndex: question.turn_index, text: question.text };
+    setIsPreparingQuestion(false);
+    setHasQuestion(true);
+    setMessages((prev) => {
+      if (prev.some((message) => message.speaker === 'interviewer' && message.turn_index === question.turn_index && message.text === question.text)) {
+        return prev;
+      }
+      return [...prev, {
+        id: `q-${question.turn_index}-${Date.now()}`,
+        turn_index: question.turn_index,
+        speaker: 'interviewer',
+        text: question.text,
+        topic: question.topic,
+        timestamp: new Date().toISOString(),
+      }];
+    });
+  };
+
   // Audio Playback Hook (AC-009, AC-010)
   const {
-    isPlaying: isAudioPlaying,
+    isBlocked: isAudioBlocked,
     queueAudio,
+    resumeAudio,
     stopAudio,
   } = useAudioPlayer({
     onPlaybackStarted: () => {
+      setVoiceError(null);
       setAgentState('speaking');
     },
     onPlaybackEnded: () => {
-      setAgentState((current) => (current === 'completed' ? 'completed' : 'listening'));
+      audioPendingRef.current = false;
+      if (completePendingRef.current) {
+        completePendingRef.current = false;
+        setIsCompleted(true);
+        stopAllTracks();
+      } else {
+        setAgentState('listening');
+      }
+    },
+    onError: (error) => {
+      audioPendingRef.current = false;
+      if (completePendingRef.current) {
+        completePendingRef.current = false;
+        setIsCompleted(true);
+        stopAllTracks();
+        return;
+      }
+      const isAutoplayBlocked = error instanceof DOMException && error.name === 'NotAllowedError';
+      if (!isAutoplayBlocked && questionAudioRef.current) {
+        questionAudioRef.current.chunks = [];
+      }
+      setVoiceError(isAutoplayBlocked
+        ? 'Your browser paused interviewer audio. Select Play Question to hear it.'
+        : 'Interviewer audio could not play. Select Play Question to try again.');
+      setAgentState('listening');
     },
   });
 
@@ -92,6 +157,7 @@ export const InterviewRoom: React.FC = () => {
     sendDoneAnswering,
     sendTextFallback,
     sendMuteToggle,
+    sendOutgoingMessage,
     reconnect,
   } = useInterviewWebSocket({
     token,
@@ -99,7 +165,14 @@ export const InterviewRoom: React.FC = () => {
     candidateEmail,
     enabled: !loading && !isCompleted && Boolean(token),
     onStatus: (msg) => {
-      if (!isAudioPlaying) {
+      if (msg.connection_id) connectionIdRef.current = msg.connection_id;
+      serverStateRef.current = msg.state;
+      if (msg.state === 'speaking') {
+        // The server has started synthesis; the avatar speaks only after audio.play succeeds.
+        setAgentState('thinking');
+      } else if (msg.state === 'listening' && pendingQuestionRef.current && !speechFailedRef.current) {
+        setAgentState('thinking');
+      } else if (!audioPendingRef.current || (msg.state !== 'listening' && msg.state !== 'completed')) {
         setAgentState(msg.state);
       }
       if (msg.question_index) setQuestionIndex(msg.question_index);
@@ -112,24 +185,91 @@ export const InterviewRoom: React.FC = () => {
       }
     },
     onQuestion: (msg) => {
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: `q-${msg.turn_index}-${Date.now()}`,
-          turn_index: msg.turn_index,
-          speaker: 'interviewer',
-          text: msg.text,
-          topic: msg.topic,
-          timestamp: new Date().toISOString(),
-        },
-      ]);
+      if (msg.connection_id) connectionIdRef.current = msg.connection_id;
+      const sameCurrentQuestion = currentQuestionRef.current?.turnIndex === msg.turn_index && currentQuestionRef.current?.text === msg.text;
+      if (sameCurrentQuestion && publishedQuestionRef.current?.turnIndex === msg.turn_index && publishedQuestionRef.current?.text === msg.text) {
+        return;
+      }
+      if (sameCurrentQuestion && pendingQuestionRef.current) {
+        if (serverStateRef.current === 'listening') {
+          const sent = sendOutgoingMessage({ type: 'replay_question' });
+          logDiagnostic(sent ? 'info' : 'warn', 'question_retry', { connection_id: connectionIdRef.current, turn_index: msg.turn_index, outcome: sent ? 'retry' : 'failure', error_code: sent ? undefined : 'REPLAY_SEND_FAILED' });
+          if (!sent) {
+            speechFailedRef.current = true;
+            setIsPreparingQuestion(false);
+            setVoiceError('Voice retry needs a connection. Retry when connected, or read the question instead.');
+            setAgentState('listening');
+          }
+        }
+        return;
+      }
+      currentQuestionRef.current = { turnIndex: msg.turn_index, text: msg.text };
+      pendingQuestionRef.current = msg;
+      questionPendingAtRef.current = diagnosticNow();
+      logDiagnostic('info', 'question_pending', { connection_id: msg.connection_id || connectionIdRef.current, turn_index: msg.turn_index });
+      speechFailedRef.current = false;
+      readFallbackRef.current = false;
+      audioPendingRef.current = false;
+      questionAudioRef.current = { turnIndex: msg.turn_index, chunks: [] };
+      setIsPreparingQuestion(true);
+      setVoiceError(null);
+      setIsTextFallbackOpen(false);
+      stopAudio();
+      setAgentState('thinking');
       if (msg.turn_index) setQuestionIndex(msg.turn_index);
       setInterimTranscript('');
       setSilenceSeconds(0);
+      // Reconnected sessions return the persisted question without automatic speech.
+      if (serverStateRef.current === 'listening') {
+        const sent = sendOutgoingMessage({ type: 'replay_question' });
+        logDiagnostic(sent ? 'info' : 'warn', 'question_retry', { connection_id: connectionIdRef.current, turn_index: msg.turn_index, outcome: sent ? 'retry' : 'failure', error_code: sent ? undefined : 'REPLAY_SEND_FAILED' });
+        if (!sent) {
+          speechFailedRef.current = true;
+          setIsPreparingQuestion(false);
+          setVoiceError('Voice retry needs a connection. Retry when connected, or read the question instead.');
+          setAgentState('listening');
+        }
+      }
     },
     onAudio: (msg) => {
-      if (msg.data) {
-        queueAudio(msg.data, msg.format || 'audio/mp3');
+      if (!msg.data || !msg.format?.startsWith('audio/')) return;
+      const pendingQuestion = pendingQuestionRef.current;
+      if (pendingQuestion) {
+        if (pendingQuestion.turn_index !== msg.turn_index) {
+          logDiagnostic('debug', 'question_stale_audio', { connection_id: msg.connection_id, turn_index: msg.turn_index });
+          return;
+        }
+        speechFailedRef.current = false;
+        readFallbackRef.current = false;
+        questionAudioRef.current = { turnIndex: msg.turn_index, chunks: [{ data: msg.data, format: msg.format, connection_id: msg.connection_id }] };
+        publishQuestion(pendingQuestion);
+        logDiagnostic('info', 'question_revealed', {
+          connection_id: msg.connection_id || connectionIdRef.current,
+          turn_index: msg.turn_index,
+          elapsed_ms: questionPendingAtRef.current === null ? undefined : diagnosticNow() - questionPendingAtRef.current,
+        });
+        questionPendingAtRef.current = null;
+      } else {
+        if (publishedQuestionRef.current?.turnIndex !== msg.turn_index) {
+          logDiagnostic('debug', 'question_stale_audio', { connection_id: msg.connection_id, turn_index: msg.turn_index });
+          return;
+        }
+        if (serverStateRef.current !== 'thinking') {
+          if (readFallbackRef.current) return;
+          questionAudioRef.current = { turnIndex: msg.turn_index, chunks: [{ data: msg.data, format: msg.format, connection_id: msg.connection_id }] };
+        }
+      }
+      audioPendingRef.current = true;
+      queueAudio(msg.data, msg.format, { connection_id: msg.connection_id || connectionIdRef.current, turn_index: msg.turn_index });
+    },
+    onError: (error) => {
+      if ('code' in error && error.code === 'TTS_FAILED') {
+        if (error.turn_index !== undefined && currentQuestionRef.current?.turnIndex !== error.turn_index) return;
+        speechFailedRef.current = true;
+        audioPendingRef.current = false;
+        setIsPreparingQuestion(false);
+        setAgentState('listening');
+        setVoiceError(error.message || 'Interviewer voice is unavailable. Select Play Question to retry.');
       }
     },
     onTranscript: (msg) => {
@@ -161,16 +301,75 @@ export const InterviewRoom: React.FC = () => {
       setThresholdSeconds(msg.threshold_seconds);
     },
     onInterviewComplete: (msg) => {
-      setIsCompleted(true);
       setClosingMessage(
         msg.closing_message ||
           'Thank you for completing your screening interview! Your responses have been submitted to the recruitment team.'
       );
-      setAgentState('completed');
-      stopAudio();
-      stopAllTracks();
+      if (audioPendingRef.current) {
+        completePendingRef.current = true;
+      } else {
+        setIsCompleted(true);
+        stopAllTracks();
+      }
     },
   });
+
+  const handlePlayQuestion = () => {
+    setVoiceError(null);
+    if (isAudioBlocked) {
+      logDiagnostic('info', 'question_retry', { connection_id: connectionIdRef.current, turn_index: currentQuestionRef.current?.turnIndex, outcome: 'retry' });
+      audioPendingRef.current = true;
+      resumeAudio();
+      return;
+    }
+    const chunks = questionAudioRef.current?.chunks || [];
+    if (!pendingQuestionRef.current && chunks.length > 0) {
+      logDiagnostic('info', 'question_retry', { connection_id: chunks[0].connection_id, turn_index: questionAudioRef.current?.turnIndex, outcome: 'retry' });
+      audioPendingRef.current = false;
+      stopAudio();
+      audioPendingRef.current = true;
+      chunks.forEach((chunk) => queueAudio(chunk.data, chunk.format, { connection_id: chunk.connection_id, turn_index: questionAudioRef.current?.turnIndex }));
+      return;
+    }
+    speechFailedRef.current = false;
+    readFallbackRef.current = false;
+    setIsPreparingQuestion(true);
+    setAgentState('thinking');
+    const sent = sendOutgoingMessage({ type: 'replay_question' });
+    logDiagnostic(sent ? 'info' : 'warn', 'question_retry', { connection_id: connectionIdRef.current, turn_index: currentQuestionRef.current?.turnIndex, outcome: sent ? 'retry' : 'failure', error_code: sent ? undefined : 'REPLAY_SEND_FAILED' });
+    if (!sent) {
+      speechFailedRef.current = true;
+      setIsPreparingQuestion(false);
+      setVoiceError('Voice retry needs a connection. Retry when connected, or read the question instead.');
+      setAgentState('listening');
+    }
+  };
+
+  const handleReadQuestion = () => {
+    const question = pendingQuestionRef.current;
+    if (!question) return;
+    readFallbackRef.current = true;
+    logDiagnostic('info', 'question_read_fallback', { connection_id: connectionIdRef.current, turn_index: question.turn_index });
+    speechFailedRef.current = false;
+    publishQuestion(question);
+    logDiagnostic('info', 'question_revealed', {
+      connection_id: connectionIdRef.current,
+      turn_index: question.turn_index,
+      elapsed_ms: questionPendingAtRef.current === null ? undefined : diagnosticNow() - questionPendingAtRef.current,
+      outcome: 'failure',
+    });
+    questionPendingAtRef.current = null;
+    setVoiceError(null);
+    setAgentState('listening');
+  };
+
+  const canAnswerCurrentQuestion = Boolean(
+    publishedQuestionRef.current &&
+    currentQuestionRef.current &&
+    !pendingQuestionRef.current &&
+    publishedQuestionRef.current.turnIndex === currentQuestionRef.current.turnIndex &&
+    publishedQuestionRef.current.text === currentQuestionRef.current.text
+  );
 
   // Live Browser Speech-to-Text Recognition (for instant visual feedback & zero latency)
   const recognitionRef = React.useRef<any>(null);
@@ -181,7 +380,7 @@ export const InterviewRoom: React.FC = () => {
 
     if (!SpeechRecognition) return;
 
-    if (isConnected && !isMuted && agentState === 'listening') {
+    if (isConnected && !isMuted && agentState === 'listening' && canAnswerCurrentQuestion) {
       try {
         const recognition = new SpeechRecognition();
         recognition.continuous = true;
@@ -189,6 +388,7 @@ export const InterviewRoom: React.FC = () => {
         recognition.lang = 'en-US';
 
         recognition.onresult = (event: any) => {
+          if (pendingQuestionRef.current) return;
           let interim = '';
           for (let i = event.resultIndex; i < event.results.length; ++i) {
             const transcript = event.results[i][0].transcript;
@@ -225,14 +425,14 @@ export const InterviewRoom: React.FC = () => {
 
         recognition.onerror = (e: any) => {
           if (e.error !== 'no-speech' && e.error !== 'aborted') {
-            console.debug('Speech recognition note:', e.error);
+            logDiagnostic('debug', 'speech_recognition_failed', { error_code: 'RECOGNITION_ERROR' });
           }
         };
 
         recognition.start();
         recognitionRef.current = recognition;
-      } catch (err) {
-        console.debug('Speech recognition init note:', err);
+      } catch {
+        logDiagnostic('debug', 'speech_recognition_failed', { error_code: 'RECOGNITION_INIT_FAILED' });
       }
     } else {
       if (recognitionRef.current) {
@@ -255,18 +455,18 @@ export const InterviewRoom: React.FC = () => {
         recognitionRef.current = null;
       }
     };
-  }, [isConnected, isMuted, agentState, questionIndex, sendTranscriptUpdate]);
+  }, [isConnected, isMuted, agentState, canAnswerCurrentQuestion, questionIndex, sendTranscriptUpdate]);
 
   // Audio Chunk Streaming via MediaRecorder Hook (AC-011, AC-014)
   useAudioRecorder({
     stream,
-    isEnabled: isConnected && !isMuted && agentState === 'listening',
+    isEnabled: isConnected && !isMuted && agentState === 'listening' && canAnswerCurrentQuestion,
     timeslice: 250,
     onAudioChunk: (chunk) => {
-      sendAudioChunk(chunk.data, chunk.format);
+      if (!pendingQuestionRef.current) sendAudioChunk(chunk.data, chunk.format);
     },
-    onError: (err) => {
-      console.warn('Audio recorder error:', err);
+    onError: () => {
+      logDiagnostic('warn', 'media_recorder_failed', { error_code: 'RECORDER_ERROR' });
     },
   });
 
@@ -288,8 +488,8 @@ export const InterviewRoom: React.FC = () => {
         }
         setLoading(false);
       })
-      .catch((err) => {
-        console.error('Failed to load session:', err);
+      .catch(() => {
+        logDiagnostic('warn', 'http_error', { operation: 'session_lookup', outcome: 'failure' });
         setLoading(false);
       });
   }, [token]);
@@ -312,6 +512,7 @@ export const InterviewRoom: React.FC = () => {
 
   // Handle Manual "Done Answering" action (AC-013)
   const handleDoneAnswering = () => {
+    if (pendingQuestionRef.current || !publishedQuestionRef.current) return;
     if (interimTranscript && interimTranscript.trim()) {
       sendTranscriptUpdate(interimTranscript.trim(), true);
     }
@@ -323,6 +524,7 @@ export const InterviewRoom: React.FC = () => {
 
   // Handle Text Fallback submission (AC-026)
   const handleTextFallbackSubmit = (text: string) => {
+    if (pendingQuestionRef.current || !publishedQuestionRef.current) return;
     sendTextFallback(text);
     setMessages((prev) => [
       ...prev,
@@ -490,6 +692,28 @@ export const InterviewRoom: React.FC = () => {
         </div>
       )}
 
+      {voiceError && (
+        <div role="alert" className="bg-amber-950/90 border-b border-amber-800 px-4 py-2.5 text-xs text-amber-100 flex flex-wrap items-center justify-between gap-2 z-10">
+          <span className="flex items-center gap-2"><AlertCircle className="w-4 h-4 shrink-0" />{voiceError}</span>
+          <div className="flex items-center gap-3">
+            <button type="button" onClick={handlePlayQuestion} className="inline-flex items-center gap-1 underline font-semibold hover:text-white">
+              <Volume2 className="w-3.5 h-3.5" /> Play Question
+            </button>
+            {pendingQuestionRef.current && (
+              <button type="button" onClick={handleReadQuestion} className="underline font-semibold hover:text-white">
+                Read question instead
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
+      {isPreparingQuestion && !voiceError && (
+        <div role="status" className="bg-indigo-950/70 border-b border-indigo-800 px-4 py-2.5 text-xs text-indigo-200 flex items-center gap-2 z-10">
+          <RefreshCw className="w-4 h-4 animate-spin" /> Preparing question and voice...
+        </div>
+      )}
+
       {/* Hardware Permission Warning Banner */}
       {(mediaStatus === 'denied' || mediaStatus === 'error') && (
         <div className="bg-amber-950/90 border-b border-amber-800 px-4 py-2 text-xs text-amber-200 flex items-center justify-between animate-fade-in z-10">
@@ -530,6 +754,7 @@ export const InterviewRoom: React.FC = () => {
             messages={messages}
             interimTranscript={interimTranscript}
             isListening={agentState === 'listening'}
+            isThinking={agentState === 'thinking' || isPreparingQuestion}
           />
 
           {/* Silence Indicator Banner (AC-012) */}
@@ -543,6 +768,12 @@ export const InterviewRoom: React.FC = () => {
           {/* Bottom Action Controls Bar (AC-012, AC-013, AC-014, AC-026) */}
           <footer className="p-4 bg-slate-950/90 border-t border-slate-800/80 flex flex-wrap items-center justify-between gap-3">
             <div className="flex items-center gap-2">
+              {hasQuestion && !isPreparingQuestion && (
+                <button type="button" onClick={handlePlayQuestion} className="flex items-center gap-1.5 px-3.5 py-2.5 rounded-xl bg-slate-900 border border-slate-700 text-slate-300 hover:bg-slate-800 text-xs font-medium transition-colors" aria-label="Play Question">
+                  <Volume2 className="w-4 h-4 text-indigo-400" />
+                  <span className="hidden sm:inline">Play Question</span>
+                </button>
+              )}
               {/* Microphone Mute Toggle (AC-014) */}
               <button
                 type="button"
@@ -561,8 +792,9 @@ export const InterviewRoom: React.FC = () => {
               <button
                 type="button"
                 onClick={() => setIsTextFallbackOpen(true)}
+                disabled={!canAnswerCurrentQuestion}
                 title="Type answer instead of speaking"
-                className="flex items-center gap-1.5 px-3.5 py-2.5 rounded-xl bg-slate-900 border border-slate-700 text-slate-300 hover:bg-slate-800 text-xs font-medium transition-colors"
+                className="flex items-center gap-1.5 px-3.5 py-2.5 rounded-xl bg-slate-900 border border-slate-700 text-slate-300 hover:bg-slate-800 disabled:opacity-50 disabled:cursor-not-allowed text-xs font-medium transition-colors"
               >
                 <Keyboard className="w-4 h-4 text-indigo-400" />
                 <span className="hidden sm:inline">Text Fallback</span>
@@ -572,7 +804,7 @@ export const InterviewRoom: React.FC = () => {
             {/* Done Answering / Next Question Action (AC-013) */}
             <button
               type="button"
-              disabled={agentState === 'speaking' || agentState === 'thinking' || isCompleted}
+              disabled={agentState === 'speaking' || agentState === 'thinking' || !canAnswerCurrentQuestion || isCompleted}
               onClick={handleDoneAnswering}
               className="flex items-center gap-2 px-5 py-2.5 rounded-xl font-semibold text-xs sm:text-sm bg-emerald-600 hover:bg-emerald-500 disabled:bg-slate-800 disabled:text-slate-500 text-white shadow-lg shadow-emerald-950 transition-all active:scale-95"
             >

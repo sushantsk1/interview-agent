@@ -1,5 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 
+import { logDiagnostic } from '../services/diagnostics';
+
 export type MediaPermissionStatus = 'idle' | 'requesting' | 'granted' | 'denied' | 'error';
 
 export interface UseMediaStreamReturn {
@@ -115,16 +117,18 @@ export function useMediaStream(autoStart = false): UseMediaStreamReturn {
       } else {
         animFrameRef.current = requestAnimationFrame(updateMeter);
       }
-    } catch (e) {
-      console.warn('AudioContext visualization setup failed:', e);
+    } catch {
+      logDiagnostic('warn', 'media_meter_failed', { error_code: 'AUDIO_CONTEXT_FAILED' });
     }
   }, []);
 
   const requestPermissions = useCallback(async (): Promise<boolean> => {
+    logDiagnostic('info', 'media_permission_request');
     setStatus('requesting');
     setErrorMessage(null);
 
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      logDiagnostic('warn', 'media_permission_failed', { error_code: 'MEDIA_API_UNAVAILABLE' });
       setStatus('error');
       setErrorMessage('Media devices API is not supported in this browser. Please use Chrome, Edge, Firefox, or Safari.');
       return false;
@@ -150,12 +154,18 @@ export function useMediaStream(autoStart = false): UseMediaStreamReturn {
       setStatus('granted');
       setIsMuted(false);
       setIsVideoOff(false);
+      logDiagnostic('info', 'media_permission_granted', { outcome: 'success' });
 
       setupAudioMeter(userStream);
       return true;
     } catch (err: unknown) {
       const error = err as { name?: string; message?: string };
-      console.error('getUserMedia error:', err);
+      logDiagnostic('warn', 'media_permission_failed', {
+        error_code: error.name === 'NotAllowedError' || error.name === 'PermissionDeniedError'
+          ? 'PERMISSION_DENIED' : error.name === 'NotFoundError' || error.name === 'DevicesNotFoundError'
+          ? 'DEVICE_NOT_FOUND' : 'MEDIA_REQUEST_FAILED',
+        outcome: 'failure',
+      });
 
       if (error.name === 'NotAllowedError' || error.name === 'PermissionDeniedError') {
         setStatus('denied');
@@ -182,6 +192,7 @@ export function useMediaStream(autoStart = false): UseMediaStreamReturn {
       track.enabled = !nextMuted;
     });
     setIsMuted(nextMuted);
+    logDiagnostic('info', 'media_muted', { muted: nextMuted });
     if (nextMuted) {
       setAudioLevel(0);
     }
@@ -195,6 +206,7 @@ export function useMediaStream(autoStart = false): UseMediaStreamReturn {
       track.enabled = !nextVideoOff;
     });
     setIsVideoOff(nextVideoOff);
+    logDiagnostic('info', 'media_video_toggled', { video_off: nextVideoOff });
   }, [isVideoOff]);
 
   useEffect(() => {
