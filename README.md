@@ -77,7 +77,7 @@ DATABASE_URL=sqlite:///./interview_agent.db
 FRONTEND_URL=http://localhost:5173
 ```
 
-Set `DEEPGRAM_REGION` to `in`, `eu`, or `au` when the matching regional endpoint is closer to the server. Keep `global` otherwise. A valid Deepgram key is required for an audible interviewer; if synthesis or browser autoplay fails, the interview room keeps the question visible and offers **Play Question**.
+Set `DEEPGRAM_REGION` to `in`, `eu`, or `au` when the matching regional endpoint is closer to the server. Keep `global` otherwise. A valid Deepgram key is required for an audible interviewer. The question waits for matching audio before appearing. If synthesis fails, choose **Play Question** to retry or **Read question instead** to reveal it. If the browser blocks autoplay after audio arrives, use **Play Question** to resume.
 
 For offline automated tests, set `MOCK_DEEPGRAM=true` to use synthetic silent audio. That mock is for protocol testing and does not produce an audible interviewer.
 
